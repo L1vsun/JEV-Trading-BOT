@@ -1,0 +1,207 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Jev Trading Bot · replay</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#06070a;--panel:#0b0d12;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.14);--ink:#e8ecf3;--dim:#7c8494;--faint:#434a58;
+  --jev:#ff5fc8;--up:#3ee08f;--dn:#ff5470;--fair:#ffd166;--b:#5cc8ff;--hold:#8b93a5;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:-apple-system,"Inter","Segoe UI",Helvetica,Arial,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+body{display:flex;align-items:center;justify-content:center;color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1}
+#stage{position:relative;width:1280px;height:720px;background:radial-gradient(ellipse at 20% 0%,#10131b,#06070a 60%);transform-origin:center;overflow:hidden}
+.pn{position:absolute;background:var(--panel);border:1px solid var(--line2);border-radius:6px;overflow:hidden}
+.ph{height:26px;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink)}
+.ph::before{content:"";width:7px;height:7px;border-radius:1px;background:var(--pc,var(--jev))}
+.ph r{margin-left:auto;color:var(--dim);letter-spacing:.08em}
+canvas{display:block}
+.bar{position:absolute;left:0;right:0;top:0;height:52px;display:flex;align-items:center;gap:26px;padding:0 20px;border-bottom:1px solid var(--line);background:rgba(0,0,0,.35)}
+.logo{display:flex;align-items:center;gap:12px}
+.mark{width:30px;height:30px;border-radius:8px;background:conic-gradient(from 200deg,#ff5fc8,#8f6bff,#5cc8ff,#ff5fc8);display:grid;place-items:center;font:800 15px var(--sans);color:#06070a;box-shadow:0 0 22px rgba(255,95,200,.45)}
+.logo b{font:700 19px var(--sans);letter-spacing:-.01em}
+.logo i{font:normal 9.5px var(--mono);letter-spacing:.18em;color:var(--dim);text-transform:uppercase;display:block;margin-top:2px}
+.kpis{display:flex;gap:24px;margin-left:auto}
+.kpi{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1}
+.kpi s{text-decoration:none;font:9px var(--mono);letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+.kpi em{font:600 17px var(--mono);font-style:normal}
+.live{font:9px var(--mono);letter-spacing:.16em;padding:4px 8px;border:1px solid var(--jev);color:var(--jev);border-radius:3px;display:flex;align-items:center;gap:6px;text-transform:uppercase}
+.live::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--jev);box-shadow:0 0 8px var(--jev)}
+.q{display:grid;grid-template-columns:132px 50px 1fr 40px;align-items:center;gap:8px;height:29px;padding:0 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:9.5px}
+.q .n{color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.q .ty{font-size:7.5px;letter-spacing:.14em;padding:2px 4px;border:1px solid currentColor;border-radius:2px;text-align:center}
+.q .bars{position:relative;height:14px;display:flex;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.04)}
+.q .bars i{display:block;height:100%;position:relative}
+.q .bars i span{position:absolute;left:4px;top:0;line-height:14px;font-size:8px;color:rgba(0,0,0,.8);font-weight:700;white-space:nowrap;overflow:hidden;max-width:calc(100% - 4px)}
+.q .cf{text-align:right;color:var(--dim)}
+.q.hot{background:rgba(255,95,200,.06)}
+.gate{display:flex;align-items:center;gap:7px;font:9px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);height:17px}
+.gate i{width:9px;height:9px;border-radius:50%;background:#20242d;border:1px solid var(--line2)}
+.gate.on{color:var(--ink)} .gate.on i{background:var(--up);box-shadow:0 0 8px var(--up);border-color:var(--up)}
+.gate.off i{background:#3a1a22;border-color:#6a2a36}
+.act{font:700 30px var(--sans);letter-spacing:-.02em}
+.sub{font:9px var(--mono);letter-spacing:.12em;color:var(--dim);text-transform:uppercase}
+pre{font:9.5px/1.5 var(--mono);color:#aab3c3;white-space:pre-wrap;padding:8px 12px}
+pre b{color:var(--jev);font-weight:500} pre u{text-decoration:none;color:var(--ink)}
+.log{font:9.5px/1.7 var(--mono);padding:6px 12px}
+.log div{display:grid;grid-template-columns:56px 38px 1fr;gap:6px;white-space:nowrap;overflow:hidden;font-size:9px}
+.pulse{position:absolute;left:0;top:0;height:2px;background:linear-gradient(90deg,transparent,var(--jev),transparent);width:40%;opacity:0}
+.foot{position:absolute;left:0;right:0;bottom:0;height:22px;display:flex;align-items:center;gap:18px;padding:0 20px;border-top:1px solid var(--line);font:8.5px var(--mono);letter-spacing:.14em;color:var(--dim);text-transform:uppercase}
+.foot b{color:var(--ink);font-weight:500} .foot .r{margin-left:auto}
+.stamp{position:absolute;font:700 13px var(--mono);letter-spacing:.14em;padding:5px 10px;border:1.5px solid;border-radius:3px;background:rgba(6,7,10,.85);pointer-events:none;opacity:0;white-space:nowrap}
+</style></head>
+<body><div id="stage">
+<div class="bar">
+  <div class="logo"><div class="mark">J</div><div><b>Jev Trading Bot</b><i id="sub">system one decisions · order-flow edge</i></div></div>
+  <div class="kpis">
+    <div class="kpi"><s>session clock</s><em id="kClk">00:00:00</em></div>
+    <div class="kpi"><s>jev calls</s><em id="kCalls" style="color:var(--jev)">0</em></div>
+    <div class="kpi"><s>latency p50</s><em id="kLat">—</em></div>
+    <div class="kpi"><s>position</s><em id="kPos">FLAT</em></div>
+    <div class="kpi"><s>session pnl</s><em id="kPnl">$0.00</em></div>
+  </div>
+  <div class="live" id="live">model</div>
+</div>
+
+<div class="pn" style="left:14px;top:64px;width:760px;height:372px;--pc:var(--b)">
+  <div class="ph">price vs fair value<r id="chR">mid · bid/ask · fair value (10 s smoothing) · 1-min candles</r></div>
+  <canvas id="cP"></canvas>
+  <div class="stamp" id="stamp"></div>
+</div>
+<div class="pn" style="left:786px;top:64px;width:480px;height:404px;--pc:var(--jev)">
+  <div class="ph">jev · one call · 12 typed answers<r id="qR">parallel</r></div>
+  <div class="pulse" id="pulse" style="top:26px"></div>
+  <div id="qs"></div>
+</div>
+<div class="pn" style="left:14px;top:446px;width:244px;height:250px;--pc:var(--up)">
+  <div class="ph">order book<r id="obR">5 levels</r></div><canvas id="cB"></canvas>
+</div>
+<div class="pn" style="left:268px;top:446px;width:506px;height:250px;--pc:var(--fair)">
+  <div class="ph">state sent to jev<r>code does the math · jev judges</r></div><pre id="st"></pre>
+</div>
+<div class="pn" style="left:786px;top:478px;width:230px;height:218px;--pc:var(--up)">
+  <div class="ph">decision</div>
+  <div style="padding:8px 12px 0"><div class="act" id="act">HOLD</div><div class="sub" id="actS">waiting</div></div>
+  <div style="padding:4px 12px" id="gates"></div>
+</div>
+<div class="pn" style="left:1026px;top:478px;width:240px;height:218px;--pc:var(--dn)">
+  <div class="ph">trade log</div><div class="log" id="log"></div>
+</div>
+<div class="foot"><span>api <b>POST /v1/systemone</b></span><span>model <b id="fM">jev-latest</b></span><span>question types <b>choice · score · noul</b></span><span class="r" id="fR">paper trading · not financial advice</span></div>
+</div>
+<script>
+const D=/*__DATA__*/null;
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+const S=$("stage"); const fit=()=>S.style.transform="scale("+Math.min(innerWidth/1280,innerHeight/720)+")"; addEventListener("resize",fit); fit();
+const SPEED=D.speed||30;                     // data seconds per real second
+const N=D.mid.length, T0=D.t0;
+const cl=(v,a,b)=>v<a?a:v>b?b:v, lerp=(a,b,k)=>a+(b-a)*k;
+function cv(id,w,h){const c=$(id); c.width=w*2; c.height=h*2; c.style.width=w+"px"; c.style.height=h+"px"; const g=c.getContext("2d"); g.scale(2,2); return g;}
+const gP=cv("cP",758,344), gB=cv("cB",242,222);
+const clock=s=>{s=Math.floor(s); return [s/3600|0,(s/60|0)%60,s%60].map(x=>String(x).padStart(2,"0")).join(":");};
+const usd=v=>(v<0?"-$":"$")+Math.abs(v).toFixed(2);
+$("live").textContent=D.model; $("fM").textContent=D.model; if(D.surrogate) $("fR").textContent="offline surrogate answers · paper trading · not financial advice";
+// ------------------------------------------------ question rows
+const COL={buy:"#3ee08f",sell:"#ff5470",hold:"#5b6272",up:"#3ee08f",down:"#ff5470",neutral:"#5b6272",unclear:"#5b6272",
+  buyers:"#3ee08f",sellers:"#ff5470",neither:"#5b6272",trending_up:"#3ee08f",trending_down:"#ff5470",ranging:"#5b6272",disorderly:"#ffb13d"};
+const SCOL=["#2b3a52","#3d5a86","#5c8bd0","#8fb8ff","#d7e6ff"];
+const qEl={}; const QS=D.questions;
+QS.forEach(q=>{const r=document.createElement("div"); r.className="q"; const tc=q.type==="choice"?"#5cc8ff":q.type==="score"?"#ffd166":"#ff5fc8";
+  r.innerHTML=`<div class="n">${q.id}</div><div class="ty" style="color:${tc}">${q.type}</div><div class="bars"></div><div class="cf"></div>`; $("qs").appendChild(r); qEl[q.id]=r;});
+function drawAnswer(q,a,hot){const r=qEl[q.id]; const bars=r.querySelector(".bars"), cf=r.querySelector(".cf"); r.classList.toggle("hot",!!hot);
+  let segs=[];
+  if(a.type==="noul"){segs=[[a.noul,"#ff5fc8","yes "+(a.noul*100).toFixed(0)+"%"],[1-a.noul,"rgba(255,255,255,.05)",""]]; cf.textContent="";}
+  else{const ks=Object.keys(a.probabilities); segs=ks.map((k,i)=>[a.probabilities[k],a.type==="score"?SCOL[Math.round(i/(Math.max(1,ks.length-1))*4)]:(COL[k]||"#6a7185"),(a.type==="score"?"L"+k:k)]);
+    cf.textContent=(a.confidence??0).toFixed(2);}
+  bars.innerHTML=segs.map(s=>`<i style="width:${(s[0]*100).toFixed(1)}%;background:${s[1]}"><span>${s[0]>.14?s[2]:""}</span></i>`).join("");}
+function mixAns(a,b,k){if(!b) return a; if(a.type==="noul") return {type:"noul",noul:lerp(a.noul,b.noul,k)};
+  const p={}; for(const key in b.probabilities) p[key]=lerp(a.probabilities[key]??0,b.probabilities[key],k); return {type:a.type,probabilities:p,confidence:lerp(a.confidence??0,b.confidence??0,k)};}
+// ------------------------------------------------ gates
+const GN=["consistent","confident","lagging","calm_enough","setup","composite"];
+$("gates").innerHTML=GN.map(g=>`<div class="gate" id="g_${g}"><i></i>${g.replace("_"," ")}</div>`).join("");
+// ------------------------------------------------ state view
+function stateText(st){if(!st) return ""; const o=st.order_flow, b=st.order_book, c=st.forming_candle;
+  return `<b>price_action</b>   1m <u>${st.price_action.last_1_minute}</u> · 5m <u>${st.price_action.last_5_minutes}</u>
+<b>order_flow</b>     15s <u>${o.last_15_seconds}</u> · 1m <u>${o.last_1_minute}</u> · 3m <u>${o.last_3_minutes}</u>
+<b>aggressor_tape</b> ${o.aggressor_tape_30s_windows_oldest_first.map(x=>"<u>"+x+"</u>").join(" → ")}
+<b>order_book</b>     best: <u>${b.best_level}</u>
+               micro-price <u>${b.micro_price}</u> · spread <u>${b.spread}</u>
+<b>flow_toxicity</b>  <u>${st.flow_toxicity}</u> · volatility <u>${st.volatility}</u>
+<b>fair_value_gap</b> <u>${st.fair_value_gap}</u>
+<b>forming_candle</b> <u>${c.progress}</u> · <u>${c.so_far}</u> · <u>${c.location_in_range}</u>
+               <u>${c.path}</u> · <u>${c.ticks}</u>
+<b>position</b>       <u>${st.position}</u>`;}
+// ------------------------------------------------ helpers
+const decAt=i=>{let lo=-1; for(let k=0;k<D.decisions.length;k++){if(D.decisions[k].i<=i) lo=k; else break;} return lo;};
+const logEl=$("log"); const logged=new Set();
+function logRow(key,tt,tag,txt,col){if(logged.has(key)) return; logged.add(key); const d=document.createElement("div"); d.innerHTML=`<span style="color:#7c8494">${clock(tt)}</span><b style="color:${col}">${tag}</b><span>${txt}</span>`; logEl.prepend(d); while(logEl.children.length>10) logEl.lastChild.remove();}
+let lastDec=-2, stampT=-99;
+// ------------------------------------------------ frame
+function frame(now){
+  const tsec=now/1000; const fi=cl(tsec*SPEED,0,N-1); const i=Math.floor(fi);
+  const tt=T0+i;
+  $("kClk").textContent=clock(tt);
+  // price chart ------------------------------------------------
+  {const g=gP,W=758,H=344,L=10,R=W-58,TOP=12,BOT=H-22; g.clearRect(0,0,W,H);
+   const span=Math.min(N,600); const a=Math.max(0,i-span*0.8|0), b=Math.min(N-1,a+span);
+   let lo=1e9,hi=-1e9; for(let k=a;k<=b;k++){lo=Math.min(lo,D.bid[k],D.fair[k]); hi=Math.max(hi,D.ask[k],D.fair[k]);} const pad=(hi-lo)*.12+1e-6; lo-=pad; hi+=pad;
+   const X=k=>L+(k-a)/(b-a)*(R-L), Y=v=>BOT-(v-lo)/(hi-lo)*(BOT-TOP);
+   g.strokeStyle="rgba(255,255,255,.05)"; g.lineWidth=1; g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#586070";
+   for(let s=0;s<=4;s++){const v=lo+(hi-lo)*s/4, y=Y(v); g.beginPath(); g.moveTo(L,y); g.lineTo(R,y); g.stroke(); g.fillText(v.toFixed(2),R+6,y+3);}
+   // candles (1-minute) behind
+   for(let c0=a-(a+T0)%60;c0<=i;c0+=60){const s=Math.max(a,c0), e=Math.min(i,c0+59); if(e<s) continue; let o=D.mid[s],cl2=D.mid[e],h=o,l=o; for(let k=s;k<=e;k++){h=Math.max(h,D.mid[k]); l=Math.min(l,D.mid[k]);}
+     const x0=X(s),x1=X(Math.min(c0+59,b)); const col=cl2>=o?"62,224,143":"255,84,112"; const forming=e===i&&c0+59>i;
+     g.fillStyle=`rgba(${col},${forming?.22:.1})`; g.fillRect(x0+1,Y(Math.max(o,cl2)),Math.max(1,x1-x0-2),Math.max(1,Math.abs(Y(o)-Y(cl2))));
+     g.strokeStyle=`rgba(${col},${forming?.7:.3})`; g.beginPath(); g.moveTo((x0+x1)/2,Y(h)); g.lineTo((x0+x1)/2,Y(l)); g.stroke();
+     if(forming&&D.decisions.length){const k=decAt(i); const dd=k>=0?D.decisions[k]:null; const cc=dd&&dd.answers.candle_close; if(cc){const up=cc.probabilities.up||0, dn=cc.probabilities.down||0; const xm=x1+6;
+       g.fillStyle="#ff5fc8"; g.font="600 9px ui-monospace,Menlo,monospace"; g.fillText("jev: "+cc.choice+" "+Math.round(Math.max(up,dn)*100)+"%",Math.min(xm,R-86),TOP+10);}}}
+   // bid/ask band
+   g.beginPath(); for(let k=a;k<=i;k++) g.lineTo(X(k),Y(D.ask[k])); for(let k=i;k>=a;k--) g.lineTo(X(k),Y(D.bid[k])); g.closePath(); g.fillStyle="rgba(92,200,255,.10)"; g.fill();
+   // fair value
+   g.beginPath(); for(let k=a;k<=i;k++){const y=Y(D.fair[k]); k===a?g.moveTo(X(k),y):g.lineTo(X(k),y);} g.strokeStyle="rgba(255,209,102,.9)"; g.setLineDash([4,3]); g.lineWidth=1.3; g.stroke(); g.setLineDash([]);
+   // mid
+   g.beginPath(); for(let k=a;k<=i;k++){const y=Y(D.mid[k]); k===a?g.moveTo(X(k),y):g.lineTo(X(k),y);} g.strokeStyle="#e8ecf3"; g.lineWidth=1.6; g.stroke();
+   // gap shading at the head
+   {const y1=Y(D.mid[i]), y2=Y(D.fair[i]); g.fillStyle=D.fair[i]>D.mid[i]?"rgba(62,224,143,.25)":"rgba(255,84,112,.25)"; g.fillRect(X(i)-2,Math.min(y1,y2),4,Math.abs(y1-y2));
+    g.fillStyle="#ffd166"; g.font="600 9px ui-monospace,Menlo,monospace"; g.fillText("fair "+D.fair[i].toFixed(2),Math.min(X(i)+8,R-70),y2-4);}
+   // flags
+   D.flags.forEach(f=>{if(f.i<a||f.i>i) return; const x=X(f.i); g.strokeStyle="rgba(255,95,200,.8)"; g.setLineDash([2,3]); g.beginPath(); g.moveTo(x,TOP); g.lineTo(x,BOT); g.stroke(); g.setLineDash([]);
+     g.fillStyle="#ff5fc8"; g.font="600 8.5px ui-monospace,Menlo,monospace"; g.fillText("DIVERGENCE "+(f.side>0?"▲":"▼"),x+4,BOT-6);});
+   // trades
+   D.trades.forEach(tr=>{[[tr.i_in,tr.px_in,tr.side>0?"#3ee08f":"#ff5470",tr.side>0?"BUY":"SELL"],[tr.i_out,tr.px_out,"#e8ecf3","EXIT"]].forEach(([k,px,col,lab])=>{if(k<a||k>i) return; const x=X(k),y=Y(px);
+     g.fillStyle=col; g.beginPath(); g.arc(x,y,4.5,0,6.283); g.fill(); g.strokeStyle="#06070a"; g.lineWidth=1.5; g.stroke(); g.font="700 8.5px ui-monospace,Menlo,monospace"; g.fillText(lab,x+7,y-7);});});
+   g.fillStyle="#e8ecf3"; g.beginPath(); g.arc(X(i),Y(D.mid[i]),3,0,6.283); g.fill();}
+  // order book ---------------------------------------------------
+  {const g=gB,W=242,H=222; g.clearRect(0,0,W,H); const L=D.bsz[i].length; const mx=Math.max(...D.bsz[i],...D.asz[i]); const rowH=17, cy=H/2, tick=D.tick;
+   g.font="9px ui-monospace,Menlo,monospace";
+   for(let k=0;k<L;k++){const ya=cy-8-(k+1)*rowH, yb=cy+8+k*rowH; const wa=D.asz[i][k]/mx*112, wb=D.bsz[i][k]/mx*112;
+     g.fillStyle="rgba(255,84,112,"+(k?0.28:0.55)+")"; g.fillRect(W-12-wa,ya+2,wa,rowH-4); g.fillStyle="rgba(62,224,143,"+(k?0.28:0.55)+")"; g.fillRect(W-12-wb,yb+2,wb,rowH-4);
+     g.fillStyle="#ff8a9c"; g.fillText((D.ask[i]+k*tick).toFixed(2),10,ya+12); g.fillStyle="#7df0b4"; g.fillText((D.bid[i]-k*tick).toFixed(2),10,yb+12);
+     g.fillStyle="#9aa3b3"; g.fillText(String(D.asz[i][k]|0),70,ya+12); g.fillText(String(D.bsz[i][k]|0),70,yb+12);}
+   g.fillStyle="#e8ecf3"; g.font="600 10px ui-monospace,Menlo,monospace"; g.fillText("mid "+D.mid[i].toFixed(3),10,cy+4);
+   const qi=(D.bsz[i][0]-D.asz[i][0])/(D.bsz[i][0]+D.asz[i][0]); g.fillStyle=qi>0?"#3ee08f":"#ff5470"; g.fillText("imb "+(qi>0?"+":"")+qi.toFixed(2),150,cy+4);
+   $("obR").textContent="vpin "+D.vpin[i].toFixed(2);}
+  // Jev answers, eased between calls --------------------------
+  const k=decAt(i);
+  if(k>=0){const d=D.decisions[k], prev=k>0?D.decisions[k-1]:null; const age=(fi-d.i)/SPEED; const e=cl(age/0.35,0,1); const ee=e*e*(3-2*e);
+    QS.forEach(q=>{const a=d.answers[q.id], pa=prev?prev.answers[q.id]:a; if(!a) return; drawAnswer(q,mixAns(pa||a,a,ee),q.id.startsWith("action"));});
+    $("pulse").style.opacity=(1-e).toFixed(2); $("pulse").style.left=(e*80-20)+"%";
+    $("qR").textContent=(d.latency_ms?Math.round(d.latency_ms)+" ms · ":"")+"call #"+(D.call0+k+1);
+    $("kCalls").textContent=String(D.call0+k+1);
+    $("kLat").textContent=D.latency_p50?Math.round(D.latency_p50)+" ms":"local";
+    const col=d.action==="buy"?"#3ee08f":d.action==="sell"?"#ff5470":d.action==="exit"?"#ffd166":"#8b93a5";
+    $("act").textContent=d.action.toUpperCase()+(d.size?" ×"+d.size:""); $("act").style.color=col; $("actS").textContent=d.reason;
+    GN.forEach(gn=>{const el=$("g_"+gn); const v=d.gates[gn]; el.className="gate"+(v===true?" on":v===false?" off":"");});
+    $("st").innerHTML=stateText(d.state);
+    if(k!==lastDec){lastDec=k; if(d.action!=="hold"){stampT=tsec; const s=$("stamp"); s.textContent=(d.action==="exit"?"EXIT":d.action.toUpperCase())+" · composite "+(d.composite>=0?"+":"")+d.composite.toFixed(2); s.style.color=col; s.style.borderColor=col;}}}
+  {const s=$("stamp"); const age=tsec-stampT; s.style.opacity=age<2.2?cl(age*5,0,1)*cl((2.2-age)*2,0,1):0; s.style.left="50%"; s.style.top="44%"; s.style.transform="translate(-50%,-50%) scale("+(1+Math.max(0,.25-age)*.6)+")";}
+  // position / pnl / log --------------------------------------
+  const pos=D.pos[i]; $("kPos").textContent=pos>0?"LONG":pos<0?"SHORT":"FLAT"; $("kPos").style.color=pos>0?"#3ee08f":pos<0?"#ff5470":"#e8ecf3";
+  const pnl=D.equity[i]-D.equity[0]; $("kPnl").textContent=(pnl>=0?"+":"")+usd(pnl); $("kPnl").style.color=pnl>0?"#3ee08f":pnl<0?"#ff5470":"#e8ecf3";
+  D.flags.forEach((f,n)=>{if(f.i<=i) logRow("f"+n,T0+f.i,"FLAG",(f.side>0?"fair value above price":"fair value below price"),"#ff5fc8");});
+  D.trades.forEach((tr,n)=>{if(tr.i_in<=i) logRow("i"+n,T0+tr.i_in,tr.side>0?"BUY":"SELL","@ "+tr.px_in.toFixed(2)+" ×"+tr.qty,tr.side>0?"#3ee08f":"#ff5470");
+    if(tr.i_out<=i) logRow("o"+n,T0+tr.i_out,"EXIT","@ "+tr.px_out.toFixed(2)+" "+(tr.pnl>=0?"+":"")+usd(tr.pnl),tr.pnl>=0?"#3ee08f":"#ff5470");});
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script></body></html>

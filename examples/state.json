@@ -1,0 +1,36 @@
+{
+  "market": "one instrument, 1-second limit order book snapshots",
+  "price_action": {
+    "last_1_minute": "falling steadily",
+    "last_5_minutes": "flat"
+  },
+  "order_flow": {
+    "last_15_seconds": "heavy selling",
+    "last_1_minute": "moderate selling",
+    "last_3_minutes": "balanced",
+    "aggressor_tape_30s_windows_oldest_first": [
+      "moderate buying",
+      "light buying",
+      "light selling",
+      "light selling",
+      "moderate selling"
+    ]
+  },
+  "order_book": {
+    "best_level": "ask queue thicker than the bid",
+    "top_five_levels": "roughly even queues",
+    "micro_price": "leans toward the bid",
+    "spread": "two ticks, normal"
+  },
+  "flow_toxicity": "extreme",
+  "volatility": "normal",
+  "fair_value_gap": "price is above where the order flow says it should be",
+  "forming_candle": {
+    "progress": "11 of 60 seconds",
+    "so_far": "down moderately",
+    "location_in_range": "pinned at the low",
+    "path": "the move was spread evenly",
+    "ticks": "mostly downticks"
+  },
+  "position": "flat"
+}

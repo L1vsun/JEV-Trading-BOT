@@ -1,0 +1,181 @@
+"""Command line: ``jev-bot <command>``.
+
+    jev-bot demo                  simulate a session, trade it, write report + replay
+    jev-bot backtest --csv f.csv  trade your own snapshot data
+    jev-bot paper                 stream a simulated market in real time, decide live
+    jev-bot ask state.json        send one state to Jev and print the typed answers
+    jev-bot models                list the models your key can use
+    jev-bot simulate out.csv      write a synthetic session to CSV
+
+``--model surrogate`` (the default when TYPESAFE_API_KEY is unset) uses the
+offline stand-in; ``--model jev-latest`` (or a pinned ``jev-1.13.0``) calls
+the real API. ``--cache file.jsonl`` records every call so a run can be
+replayed later with ``--replay-cache`` and no key.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from .book import load_csv
+from .engine import RunConfig, run
+from .questions import decision_questions
+from .sim import SimConfig, simulate
+from .surrogate import JevSurrogate
+from .typesafe import JevClient, JevError, ResponseCache
+
+
+def make_jev(args) -> object:
+    name = args.model or ("jev-latest" if os.environ.get("TYPESAFE_API_KEY") else "surrogate")
+    if name == "surrogate":
+        return JevSurrogate()
+    cache = ResponseCache(args.cache or args.replay_cache) if (args.cache or args.replay_cache) else None
+    return JevClient(model=name, cache=cache, cache_only=bool(args.replay_cache))
+
+
+def report(res, out_dir: Path) -> str:
+    m = res.metrics
+    f = lambda v, d=2: "n/a" if v is None else f"{v:.{d}f}"
+    lines = [
+        f"# Jev Trading Bot · session report", "",
+        f"model: `{res.model}`" + ("  (offline surrogate, not the real Jev)" if res.model.startswith("surrogate") else ""), "",
+        "| metric | value |", "|---|---|",
+        f"| Jev calls | {m['decisions']} ({m['holds']} holds) |",
+        f"| trades | {m['trades']} |",
+        f"| net PnL (after fees) | ${m['pnl']:.2f} |",
+        f"| hit rate | {m['hit_rate'] * 100:.1f}% |",
+        f"| max drawdown | ${m['max_drawdown']:.2f} |",
+        f"| beats random traders (same trade count and hold times) | {f(m.get('beats_random_traders_pct'), 1)}% of {RunConfig().n_random} |",
+        f"| divergence flags / followed by a 2σ move in 10 min | {m['flags']} / {m['flags_followed_by_2sigma_move']} |",
+        f"| median time from flag to half the move | {f(m['median_lead_to_half_move_s'], 0)} s |",
+        f"| forming-candle read, Jev (when not 'unclear') | {f(m['candle_read_jev_accuracy'] and m['candle_read_jev_accuracy'] * 100, 1)}% on {f(m['candle_read_jev_coverage'] and m['candle_read_jev_coverage'] * 100, 0)}% of ticks |",
+        f"| forming-candle read, quant logistic model | {f(m['candle_read_quant_accuracy'] and m['candle_read_quant_accuracy'] * 100, 1)}% |",
+        f"| forming-candle read, naive (keeps current colour) | {f(m['candle_read_naive_accuracy'] and m['candle_read_naive_accuracy'] * 100, 1)}% |",
+    ]
+    if res.usage:
+        u = res.usage
+        lines.append(f"| API usage | {u['calls']} calls · {u['input_tokens']:,} input tokens · ${u['cost_usd']:.4f} · p50 {f(u['p50_latency_ms'], 0)} ms |")
+    lines += ["", "## trades", "", "| # | side | qty | in | out | pnl | entry reason | exit |", "|---|---|---|---|---|---|---|---|"]
+    for i, t in enumerate(res.trades, 1):
+        lines.append(f"| {i} | {'long' if t.side > 0 else 'short'} | {t.qty:.0f} | {t.px_in:.2f} | {t.px_out:.2f} | {t.pnl:+.2f} | {t.reason_in} | {t.reason_out} |")
+    text = "\n".join(lines) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.md").write_text(text)
+    with (out_dir / "decisions.jsonl").open("w") as fh:
+        for d in res.decisions:
+            fh.write(json.dumps({"t": d.t, "action": d.action, "size": d.size, "composite": round(d.composite, 4),
+                                 "gates": d.gates, "reason": d.reason, "answers": d.answers}) + "\n")
+    return text
+
+
+def cmd_demo(args) -> None:
+    m, _ = simulate(SimConfig(seconds=args.hours * 3600, seed=args.seed))
+    _session(m, args)
+
+
+def cmd_backtest(args) -> None:
+    _session(load_csv(args.csv), args)
+
+
+def _session(m, args) -> None:
+    from .replay import build
+    jev = make_jev(args)
+    print(f"· {len(m):,} seconds of data · model {getattr(jev, 'model', '?')} · a call every {args.step}s")
+    res = run(m, jev, RunConfig(step=args.step), progress=True)
+    out = Path(args.out)
+    print(report(res, out))
+    html = build(m, res, out / "replay.html")
+    print(f"· report   {out / 'report.md'}\n· log      {out / 'decisions.jsonl'}\n· replay   {html}")
+
+
+def cmd_paper(args) -> None:
+    """Real-time paper loop on a simulated feed: one Jev call every --step seconds."""
+    from .decide import decide
+    from .features import feature_matrix
+    from .quant import FairValueModel
+    from .state import StateBuilder
+    jev = make_jev(args)
+    m, _ = simulate(SimConfig(seconds=args.warmup + args.minutes * 60, seed=args.seed))
+    X, _, raw = feature_matrix(m)
+    fz = FairValueModel(X.shape[1]).run(X, raw["mid"], raw["rv"], warmup=args.warmup // 2)
+    sb, qs = StateBuilder(raw, fz), decision_questions()
+    pos, px_in, t_in, pnl = 0, 0.0, 0, 0.0
+    print(f"paper trading · model {getattr(jev, 'model', '?')} · {args.minutes} min · Ctrl-C to stop")
+    for t in range(args.warmup, len(m) - 1, args.step):
+        t0 = time.perf_counter()
+        pos_txt = "flat" if not pos else f"{'long' if pos > 0 else 'short'} for {(t - t_in) // 60} min, currently {'in profit' if (raw['mid'][t] - px_in) * pos > 0 else 'at a loss'}"
+        r = jev.system_one(sb.state(t, pos_txt), qs)
+        d = decide(t, r, pos)
+        ms = (time.perf_counter() - t0) * 1000
+        if d.action in ("exit", "buy", "sell") and pos and (d.action == "exit" or (d.action == "buy") != (pos > 0)):
+            px = m.bid[t + 1] if pos > 0 else m.ask[t + 1]
+            pnl += (px - px_in) * pos * 100
+            print(f"{t:>6}s  EXIT  @ {px:.2f}   session pnl {pnl:+.2f}")
+            pos = 0
+        if d.action in ("buy", "sell") and not pos:
+            pos = 1 if d.action == "buy" else -1
+            px_in, t_in = (m.ask[t + 1] if pos > 0 else m.bid[t + 1]), t
+            print(f"{t:>6}s  {d.action.upper():4}  @ {px_in:.2f}   {d.reason}")
+        elif args.verbose:
+            print(f"{t:>6}s  {d.action:5} {ms:6.0f} ms  {d.reason}")
+        time.sleep(max(0.0, args.step / args.speed - (time.perf_counter() - t0)))
+    print(f"done · session pnl {pnl:+.2f}")
+
+
+def cmd_ask(args) -> None:
+    jev = make_jev(args)
+    state = json.loads(Path(args.state).read_text())
+    r = jev.system_one(state, decision_questions())
+    print(f"model {r.model} · {r.input_tokens} input tokens · {r.latency_ms:.0f} ms")
+    for k, a in r.answers.items():
+        if a.type == "noul":
+            print(f"  {k:26} noul   {a.noul:.2f}")
+        elif a.type == "choice":
+            print(f"  {k:26} choice {a.choice:14} conf {a.confidence:.2f}  {a.probabilities}")
+        else:
+            print(f"  {k:26} score  {a.score:.2f}  conf {a.confidence:.2f}")
+
+
+def cmd_models(args) -> None:
+    for mdl in JevClient().models():
+        print(f"{mdl.get('name'):16} {mdl.get('release_date', ''):12} {mdl.get('description', '')}")
+
+
+def cmd_simulate(args) -> None:
+    m, truth = simulate(SimConfig(seconds=args.hours * 3600, seed=args.seed))
+    m.save_csv(args.out)
+    print(f"wrote {args.out} · {len(m):,} rows · {len(truth.jumps)} hidden news jumps")
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(prog="jev-bot", description="Order-flow trading bot driven by Jev (TypeSafe System One).")
+    p.add_argument("--model", help="surrogate | jev-latest | jev-1.13.0 (default: jev-latest if TYPESAFE_API_KEY is set)")
+    p.add_argument("--cache", help="record API responses to this JSONL file")
+    p.add_argument("--replay-cache", help="answer only from this JSONL cache (no key needed)")
+    sp = p.add_subparsers(dest="cmd", required=True)
+    d = sp.add_parser("demo"); d.add_argument("--hours", type=int, default=6); d.add_argument("--seed", type=int, default=7)
+    d.add_argument("--step", type=int, default=10); d.add_argument("--out", default="runs/demo"); d.set_defaults(fn=cmd_demo)
+    b = sp.add_parser("backtest"); b.add_argument("--csv", required=True); b.add_argument("--step", type=int, default=10)
+    b.add_argument("--out", default="runs/backtest"); b.set_defaults(fn=cmd_backtest)
+    pp = sp.add_parser("paper"); pp.add_argument("--minutes", type=int, default=30); pp.add_argument("--step", type=int, default=5)
+    pp.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier"); pp.add_argument("--warmup", type=int, default=1800)
+    pp.add_argument("--seed", type=int, default=11); pp.add_argument("-v", "--verbose", action="store_true"); pp.set_defaults(fn=cmd_paper)
+    a = sp.add_parser("ask"); a.add_argument("state"); a.set_defaults(fn=cmd_ask)
+    sp.add_parser("models").set_defaults(fn=cmd_models)
+    s = sp.add_parser("simulate"); s.add_argument("out"); s.add_argument("--hours", type=int, default=6); s.add_argument("--seed", type=int, default=7)
+    s.set_defaults(fn=cmd_simulate)
+    args = p.parse_args(argv)
+    try:
+        args.fn(args)
+    except JevError as e:
+        sys.exit(f"jev: {e}")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
