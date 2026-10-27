@@ -106,6 +106,14 @@ jev-bot --replay-cache runs/jev.jsonl --model jev-latest demo   # replay it, no 
 jev-bot --model jev-latest paper --minutes 30 -v                # real-time paper loop
 ```
 
+Live XAUUSD through a MetaTrader 5 terminal is a separate command and stays
+in dry-run until you opt in. Setup, the cent-account limits and the book
+signals that go quiet without depth are in [Live trading](#live-trading-metatrader-5).
+
+```bash
+jev-bot live --broker mt5 --dry-run
+```
+
 A 6-hour session at one call every 10 s is 1,980 calls. The request (state
 plus 12 questions) is about 5.2k characters, roughly 1,300 input tokens, so a
 session is ~2.6 M tokens, **about $0.11** at the published $0.042 per million.
@@ -147,6 +155,75 @@ anything.
 
 ---
 
+## Live trading (MetaTrader 5)
+
+`jev-bot live` runs the same feature, state and decision path as `paper`.
+The one-second book comes from a logged-in MetaTrader 5 terminal instead of
+`sim.py`, and an order that passes the risk checks is either logged or sent
+with `order_send`. The official `MetaTrader5` package only imports on the
+Windows machine where the terminal is installed. Linux and the test suite use
+a fake terminal, so nothing here talks to a broker during tests.
+
+```bash
+pip install -e ".[mt5]"          # on that Windows machine, next to the terminal
+jev-bot live --broker mt5 --dry-run
+```
+
+### Terminal setup
+
+1. Install MetaTrader 5 and open a **RoboForex demo** account in the terminal.
+2. Turn on **Algo Trading** (Tools → Options → Expert Advisors, and the AutoTrading button in the toolbar).
+3. Show the gold symbol in Market Watch. The name is often `XAUUSD`, and on RoboForex it is often `XAUUSDc`, `XAUUSD.c` or `XAUUSDm`. `--symbol XAUUSD` uses the exact name when the terminal has it, and otherwise tries those suffixes.
+4. Leave the terminal logged in. Login, password and server are read from `MT5_LOGIN`, `MT5_PASSWORD` and `MT5_SERVER` only when you want the process to attach by itself. They are never written into the repo or into the log. `TYPESAFE_API_KEY` stays in the environment as well. With the three `MT5_*` variables unset, the bot attaches to the terminal that is already logged in.
+
+### What is sent
+
+Dry-run is the default, including when you pass `--dry-run` explicitly. Orders are printed and the terminal's `order_send` is not called.
+
+```bash
+jev-bot live --broker mt5 --dry-run          # log only
+jev-bot live --broker mt5 --send             # demo or contest account
+```
+
+A real-money account, **including a cent account**, needs both the flag and the confirmation phrase:
+
+```bash
+export MT5_CONFIRM_REAL=YES_TRADE_REAL
+jev-bot live --broker mt5 --send --allow-real
+```
+
+Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size is half of `--lot` and is skipped when that is below the broker's volume step (use `--lot 0.02` when the minimum is `0.01` and you want the half-size rung). Volume is snapped down to the step, entries wider than `--max-spread` (points) are skipped, and the filling mode follows the symbol: market and exchange execution use `RETURN`, instant execution uses `FOK` or `IOC` as the symbol allows. `--deviation` is the slippage in points. `--sl-points` and `--tp-points` are optional; `0` leaves that side unset, and a stop closer than the broker minimum is widened to it. Buys pay the ask, sells hit the bid.
+
+### Limits
+
+| control | default | effect |
+|---|---|---|
+| `--max-lots` | `0.05` | one order, and the resulting position, cannot be larger |
+| `--max-positions` | `1` | no new entry at the cap; closes are still sent |
+| `--max-daily-loss` | `20` | account currency (cents on a cent account), from 00:00 UTC. At the line, everything this bot opened is closed and the process stops |
+| `--hours gold` | on | XAUUSD session in New York time, with a few minutes of buffer around the daily break. `--hours always` disables the filter |
+| `jev.KILL` | `--kill-file` | creating this file closes the bot's positions and stops the process. Ctrl-C does the same |
+| Jev errors, a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |
+
+Closes use the bot's magic number (`--magic`, default `20261027`) on the configured symbol. Other positions on the account are left alone. A symbol the terminal marks close-only or disabled is not opened.
+
+### Depth, and the signals that go quiet
+
+Each second is one row: last bid, last ask, and tick volume signed by the MT5 tick flags (then by the last price, then by the tick rule). When `market_book_get` returns both a bid and an ask, those levels fill the book, up to five. Otherwise the second is a **level-1 fallback** with the same placeholder size on both sides, so the math in `features.py` stays defined.
+
+These signals are degraded on that fallback. The state field Jev reads is in parentheses:
+
+- queue imbalance (`order_book.best_level`) — the two queues are equal, so the imbalance is zero
+- depth imbalance (`order_book.top_five_levels`) — one level copies the best level
+- micro-price (`order_book.micro_price`) — equal queues put the weighted mid on the mid
+- order-flow imbalance magnitude — the size terms are 1; the sign of a quote change remains
+
+These keep using bid, ask and the signed tick volume: aggressor trade imbalance, VPIN, Kyle's λ, spread, realised volatility, momentum, the forming candle, and the fair-value model. The fair-value fit still runs; its book inputs are flat while the placeholder book sits in the window, so that part of the fit is idle. History loaded from the terminal has no depth either. The first decisions wait until `--warmup` seconds are in the window (1800 by default, and at least 300, which is the momentum window in `features.py`). A quiet second still records the current bid and ask with zero volume. `copy_ticks_range` fills the warmup when the terminal has the ticks.
+
+Gold spreads and commissions are wide relative to the move this bot is built to catch. They can consume the edge entirely. The table in the previous section is the simulator, with the surrogate, on a book that was built to contain the effect. It is not a live result and it is not a forecast for XAUUSD.
+
+---
+
 ## Layout
 
 ```
@@ -162,8 +239,12 @@ jev_bot/
   engine.py      the session loop, fills, grading
   sim.py         synthetic order book with a hidden fair value
   replay.py      builds the animated HTML dashboard (assets/dashboard.html)
-  cli.py         jev-bot demo | backtest | paper | ask | models | simulate
-tests/           20 tests: math, causality, client against a fake API, gates, end to end
+  live.py        live session: the same features, state and decision, on a broker feed
+  mt5_feed.py    one-second bars, tick-flag aggressor, level-1 fallback
+  mt5_broker.py  MetaTrader 5 terminal: symbols, quotes, depth, order_send
+  risk.py        dry-run, account gate, lot/spread/loss limits, session hours, kill file
+  cli.py         jev-bot demo | backtest | paper | live | ask | models | simulate
+tests/           the original 20 (math, causality, client, gates, end to end) plus the MT5 adapter and risk limits
 docs/MATH.md     the formulas and the papers they come from
 ```
 
@@ -175,7 +256,10 @@ python -m pytest          # or: python -m unittest
 
 ## Disclaimer
 
-Research and education code. Paper trading only; there is no exchange
-connectivity and none is planned here. Nothing in this repository is financial
-advice. Jev and TypeSafe are products of TypeSafe AI; this project is not
-affiliated with them.
+Research and education code. The default live command logs orders and sends
+nothing. A demo account can place orders with `--send`. A real-money or cent
+account also needs `--allow-real` and `MT5_CONFIRM_REAL`. Gold spreads and
+fees can erase the edge the simulator reports, and those simulator numbers
+are not a live result. Nothing in this repository is financial advice. Jev
+and TypeSafe are products of TypeSafe AI; this project is not affiliated
+with them or with RoboForex.

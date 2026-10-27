@@ -1,0 +1,385 @@
+"""Hard limits for a live broker session.
+
+The default is to log orders and send nothing. A demo or contest account may
+send orders only with an explicit ``--send``. A real-money account, including
+a cent account, also needs ``--allow-real`` and the environment variable
+``MT5_CONFIRM_REAL`` set to :data:`CONFIRM_PHRASE`. Login, password and server
+never pass through these messages.
+"""
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CONFIRM_PHRASE = "YES_TRADE_REAL"
+
+# Official MetaTrader 5 enum values. SYMBOL_FILLING_* is a bitmask on the
+# symbol; ORDER_FILLING_* is the integer written into ``order_send``.
+SYMBOL_FILLING_FOK = 1
+SYMBOL_FILLING_IOC = 2
+ORDER_FILLING_FOK = 0
+ORDER_FILLING_IOC = 1
+ORDER_FILLING_RETURN = 2
+EXEC_REQUEST = 0
+EXEC_INSTANT = 1
+EXEC_MARKET = 2
+EXEC_EXCHANGE = 3
+SYMBOL_TRADE_DISABLED = 0
+SYMBOL_TRADE_LONGONLY = 1
+SYMBOL_TRADE_SHORTONLY = 2
+SYMBOL_TRADE_CLOSEONLY = 3
+SYMBOL_TRADE_FULL = 4
+
+_SECRET_ENV = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_PATH", "TYPESAFE_API_KEY")
+_NY: ZoneInfo | None
+try:
+    _NY = ZoneInfo("America/New_York")
+except Exception:
+    _NY = None
+
+
+class RiskError(RuntimeError):
+    """This order must not be sent. The session keeps running."""
+
+
+class TradingHalted(RuntimeError):
+    """A hard stop. Flatten and leave the session."""
+
+
+class ConnectionLost(RuntimeError):
+    """The terminal is gone or has stopped answering."""
+
+
+class SymbolError(RuntimeError):
+    """The configured symbol is not in the terminal."""
+
+
+def redact(text: str) -> str:
+    """Remove credential values that happen to be in the environment."""
+    out = text
+    for key in _SECRET_ENV:
+        val = os.environ.get(key) or ""
+        if len(val) >= 4 and val in out:
+            out = out.replace(val, "***")
+    return out
+
+
+def read_mt5_credentials() -> dict[str, str]:
+    """Login, password and server come from the environment, or not at all.
+
+    All three must be set together. When none are set the terminal's existing
+    login is used. The returned password is for ``initialize`` only; callers
+    must not log the dict.
+    """
+    login = os.environ.get("MT5_LOGIN", "").strip()
+    password = os.environ.get("MT5_PASSWORD", "")
+    server = os.environ.get("MT5_SERVER", "").strip()
+    path = os.environ.get("MT5_PATH", "").strip()
+    present = (bool(login), bool(password), bool(server))
+    if any(present) and not all(present):
+        raise RiskError("set MT5_LOGIN, MT5_PASSWORD and MT5_SERVER together, or leave all three unset")
+    if login and not login.isdigit():
+        raise RiskError("MT5_LOGIN must be the numeric account id")
+    out = {"login": login, "password": password, "server": server, "path": path}
+    return out
+
+
+def trade_mode_name(mode: int) -> str:
+    """Map an MT5 account trade mode. Anything unknown is treated as real."""
+    return {0: "demo", 1: "contest", 2: "real"}.get(int(mode), "real")
+
+
+def assert_may_send(trade_mode: str, *, dry_run: bool, allow_real: bool, confirm: str | None) -> None:
+    """Refuse to send orders unless the account and the flags agree.
+
+    Dry-run always passes. Demo and contest accounts pass when the caller has
+    already chosen to send. Real-money accounts pass only with both the flag
+    and the confirmation phrase.
+    """
+    if dry_run:
+        return
+    if trade_mode in ("demo", "contest"):
+        return
+    if allow_real and confirm == CONFIRM_PHRASE:
+        return
+    raise RiskError(
+        "refusing to send orders on a real-money account; "
+        "pass --allow-real and set MT5_CONFIRM_REAL to the confirmation phrase"
+    )
+
+
+@dataclass(frozen=True)
+class RiskLimits:
+    max_lots: float = 0.05
+    max_positions: int = 1
+    max_daily_loss: float = 20.0          # account currency (USC on a cent account)
+    max_spread_points: float = 80.0
+    lot: float = 0.01                      # full-size order; half size is lot/2
+    sl_points: float = 0.0                 # 0 = no stop
+    tp_points: float = 0.0
+    deviation_points: int = 30             # slippage allowance, in points
+
+    def validate(self) -> None:
+        if self.max_lots <= 0:
+            raise RiskError("max_lots must be positive")
+        if self.max_positions < 0:
+            raise RiskError("max_positions must be >= 0")
+        if self.max_daily_loss <= 0:
+            raise RiskError("max_daily_loss must be positive")
+        if self.lot <= 0:
+            raise RiskError("lot must be positive")
+        if self.lot > self.max_lots + 1e-12:
+            raise RiskError("lot is above max_lots")
+        if self.sl_points < 0 or self.tp_points < 0:
+            raise RiskError("sl/tp points must be >= 0")
+        if self.deviation_points < 0:
+            raise RiskError("deviation must be >= 0")
+        if self.max_spread_points <= 0:
+            raise RiskError("max_spread_points must be positive")
+
+
+def loss_breached(pnl: float, limit: float) -> bool:
+    return pnl <= -abs(limit)
+
+
+def check_entry(limits: RiskLimits, volume: float, open_positions: int, current_lots: float) -> None:
+    if open_positions >= limits.max_positions:
+        raise RiskError("max open positions reached")
+    if volume > limits.max_lots + 1e-12:
+        raise RiskError("volume above max_lots")
+    if current_lots + volume > limits.max_lots + 1e-12:
+        raise RiskError("position would exceed max_lots")
+
+
+def _decimals(step: float) -> int:
+    text = f"{step:.8f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        return 0
+    return min(8, len(text.split(".")[1]))
+
+
+def normalize_volume(volume: float, vmin: float, vmax: float, step: float) -> float:
+    """Snap ``volume`` down onto the broker's step grid.
+
+    Values under the minimum are rejected. Values over the broker maximum are
+    rejected rather than silently reduced.
+    """
+    if vmin <= 0 or step <= 0 or vmax <= 0:
+        raise RiskError("broker volume constraints are invalid")
+    if volume < vmin - 1e-9:
+        raise RiskError("volume below broker minimum")
+    if volume > vmax + 1e-9:
+        raise RiskError("volume above broker maximum")
+    steps = math.floor((volume - vmin) / step + 1e-8)
+    snapped = round(vmin + steps * step, _decimals(step))
+    if snapped < vmin - 1e-9:
+        raise RiskError("volume below broker minimum")
+    if snapped > vmax + 1e-9:
+        raise RiskError("volume above broker maximum")
+    return snapped
+
+
+def select_filling(filling_mode: int, trade_exemode: int) -> int:
+    """Pick the ``type_filling`` value ``order_send`` will accept.
+
+    Market and exchange execution use RETURN. Instant and request execution
+    use FOK when the symbol allows it, otherwise IOC, otherwise RETURN.
+    ``filling_mode`` is the symbol bitmask (FOK=1, IOC=2), which is not the
+    same numbering as the order enum.
+    """
+    if trade_exemode in (EXEC_MARKET, EXEC_EXCHANGE):
+        return ORDER_FILLING_RETURN
+    if filling_mode & SYMBOL_FILLING_FOK:
+        return ORDER_FILLING_FOK
+    if filling_mode & SYMBOL_FILLING_IOC:
+        return ORDER_FILLING_IOC
+    return ORDER_FILLING_RETURN
+
+
+@dataclass(frozen=True)
+class SymbolSpec:
+    bid: float
+    ask: float
+    point: float
+    digits: int
+    volume_min: float
+    volume_max: float
+    volume_step: float
+    stops_level: int
+    freeze_level: int
+    filling_mode: int
+    trade_exemode: int
+    symbol_trade_mode: int = SYMBOL_TRADE_FULL
+    contract_size: float = 100.0
+    tick_size: float = 0.01
+
+    @property
+    def spread_points(self) -> float:
+        if self.point <= 0:
+            return float("inf")
+        return (self.ask - self.bid) / self.point
+
+
+@dataclass(frozen=True)
+class OrderIntent:
+    side: int
+    volume: float
+    price: float
+    sl: float
+    tp: float
+    deviation: int
+    filling: int
+    digits: int
+    volume_digits: int
+    stops_adjusted: bool = False
+
+    @property
+    def filling_name(self) -> str:
+        return {ORDER_FILLING_FOK: "FOK", ORDER_FILLING_IOC: "IOC", ORDER_FILLING_RETURN: "RETURN"}.get(
+            self.filling, str(self.filling))
+
+
+def _round_px(px: float, digits: int) -> float:
+    return round(px, max(0, digits))
+
+
+def build_order(side: int, volume: float, spec: SymbolSpec, limits: RiskLimits) -> OrderIntent:
+    """Turn a sized decision into a market-deal request the terminal can accept.
+
+    Buys pay the ask and sells hit the bid. Stops closer than the broker's
+    minimum distance are widened to that distance. A spread wider than the
+    configured cap refuses the entry.
+    """
+    if side not in (1, -1):
+        raise RiskError("side must be buy or sell")
+    if spec.point <= 0 or spec.bid <= 0 or spec.ask <= 0:
+        raise RiskError("broker quote is not usable")
+    if spec.ask < spec.bid:
+        raise RiskError("crossed quote")
+    mode = spec.symbol_trade_mode
+    if mode in (SYMBOL_TRADE_DISABLED, SYMBOL_TRADE_CLOSEONLY):
+        raise RiskError("symbol is closed for new trades")
+    if mode == SYMBOL_TRADE_LONGONLY and side < 0:
+        raise RiskError("symbol is long only")
+    if mode == SYMBOL_TRADE_SHORTONLY and side > 0:
+        raise RiskError("symbol is short only")
+    if spec.spread_points > limits.max_spread_points + 1e-9:
+        raise RiskError(f"spread {spec.spread_points:.0f}pts above max")
+    if volume > limits.max_lots + 1e-12:
+        raise RiskError("volume above max_lots")
+    snapped = normalize_volume(volume, spec.volume_min, spec.volume_max, spec.volume_step)
+    if snapped > limits.max_lots + 1e-12:
+        raise RiskError("volume above max_lots")
+    price = spec.ask if side > 0 else spec.bid
+    min_points = max(int(spec.stops_level), int(spec.freeze_level), 0)
+    adjusted = False
+
+    def dist(points: float) -> float:
+        nonlocal adjusted
+        if points <= 0:
+            return 0.0
+        if points < min_points:
+            adjusted = True
+            points = float(min_points)
+        return points * spec.point
+
+    sl_d, tp_d = dist(limits.sl_points), dist(limits.tp_points)
+    if side > 0:
+        sl = price - sl_d if sl_d else 0.0
+        tp = price + tp_d if tp_d else 0.0
+    else:
+        sl = price + sl_d if sl_d else 0.0
+        tp = price - tp_d if tp_d else 0.0
+    return OrderIntent(
+        side=side, volume=snapped, price=_round_px(price, spec.digits),
+        sl=_round_px(sl, spec.digits) if sl else 0.0,
+        tp=_round_px(tp, spec.digits) if tp else 0.0,
+        deviation=int(limits.deviation_points),
+        filling=select_filling(spec.filling_mode, spec.trade_exemode),
+        digits=spec.digits, volume_digits=_decimals(spec.volume_step),
+        stops_adjusted=adjusted,
+    )
+
+
+def format_intent(symbol: str, intent: OrderIntent, spread_points: float, *, dry_run: bool) -> str:
+    side = "BUY" if intent.side > 0 else "SELL"
+    head = "DRY-RUN " if dry_run else ""
+    vd, pd = intent.volume_digits, intent.digits
+    sl = f"{intent.sl:.{pd}f}" if intent.sl else "off"
+    tp = f"{intent.tp:.{pd}f}" if intent.tp else "off"
+    note = " stops widened to the broker minimum" if intent.stops_adjusted else ""
+    return (
+        f"{head}{side} {symbol} {intent.volume:.{vd}f} @ {intent.price:.{pd}f} "
+        f"sl={sl} tp={tp} deviation={intent.deviation}pts filling={intent.filling_name} "
+        f"spread={spread_points:.0f}pts{note}"
+    )
+
+
+class KillSwitch:
+    """A file in the working directory. Creating it flattens and stops."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def tripped(self) -> bool:
+        return self.path.exists()
+
+
+def gold_session_open(now: datetime) -> bool:
+    """XAUUSD session in New York time: Sunday 17:05 through Friday 16:55.
+
+    The daily break is 16:55–17:05 New York. ``zoneinfo`` follows US daylight
+    saving, which is the clock the gold session actually uses. When the
+    timezone data is missing, a fixed UTC approximation (17:00 New York ≈
+    22:00 UTC) is used instead.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if _NY is not None:
+        local = now.astimezone(_NY)
+        wd = local.weekday()
+        minute = local.hour * 60 + local.minute
+        open_at, shut = 17 * 60 + 5, 16 * 60 + 55
+    else:
+        local = now.astimezone(timezone.utc)
+        wd = local.weekday()
+        minute = local.hour * 60 + local.minute
+        open_at, shut = 22 * 60 + 5, 21 * 60 + 55
+    if wd == 5:
+        return False
+    if wd == 6:
+        return minute >= open_at
+    if wd == 4 and minute >= shut:
+        return False
+    if wd in (0, 1, 2, 3) and shut <= minute < open_at:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class MarketHours:
+    """``name`` is ``gold`` or ``always``. ``always`` is an explicit override."""
+
+    name: str = "gold"
+
+    def is_open(self, now: datetime) -> bool:
+        if self.name == "always":
+            return True
+        if self.name != "gold":
+            raise RiskError("market hours must be 'gold' or 'always'")
+        return gold_session_open(now)
+
+
+def position_text(side: int, t: int, t_in: int, px_in: float, bid: float, ask: float) -> str:
+    """Same wording as the paper loop, so Jev sees a familiar ``position`` field."""
+    if not side:
+        return "flat"
+    held = max(0, t - t_in)
+    mid = (bid + ask) / 2
+    upnl = (mid - px_in) * side
+    state = "in profit" if upnl > 0 else "at a loss" if upnl < 0 else "flat"
+    return f"{'long' if side > 0 else 'short'} for {held // 60} min {held % 60} s, currently {state}"

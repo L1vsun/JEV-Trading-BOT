@@ -3,6 +3,7 @@
     jev-bot demo                  simulate a session, trade it, write report + replay
     jev-bot backtest --csv f.csv  trade your own snapshot data
     jev-bot paper                 stream a simulated market in real time, decide live
+    jev-bot live --broker mt5     same loop on a MetaTrader 5 terminal (dry-run unless --send)
     jev-bot ask state.json        send one state to Jev and print the typed answers
     jev-bot models                list the models your key can use
     jev-bot simulate out.csv      write a synthetic session to CSV
@@ -151,7 +152,26 @@ def cmd_simulate(args) -> None:
     print(f"wrote {args.out} · {len(m):,} rows · {len(truth.jumps)} hidden news jumps")
 
 
-def main(argv: list[str] | None = None) -> None:
+def cmd_live(args) -> None:
+    """One-second MT5 book, the same features and Jev call as paper, real orders only with --send."""
+    from .live import LiveSession, live_config_from_args
+    from .mt5_broker import MT5Broker
+    from .risk import ConnectionLost, RiskError, SymbolError, TradingHalted, redact
+    try:
+        cfg = live_config_from_args(args)
+        broker = MT5Broker(symbol=cfg.symbol, magic=cfg.magic, deviation=cfg.limits.deviation_points)
+        LiveSession(broker, make_jev(args), cfg).run()
+    except KeyboardInterrupt:
+        print("stopped", flush=True)
+    except TradingHalted as e:
+        sys.exit(f"halted: {redact(str(e))}")
+    except ConnectionLost as e:
+        sys.exit(f"connection lost: {redact(str(e))}")
+    except (RiskError, SymbolError) as e:
+        sys.exit(f"live: {redact(str(e))}")
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="jev-bot", description="Order-flow trading bot driven by Jev (TypeSafe System One).")
     p.add_argument("--model", help="surrogate | jev-latest | jev-1.13.0 (default: jev-latest if TYPESAFE_API_KEY is set)")
     p.add_argument("--cache", help="record API responses to this JSONL file")
@@ -164,15 +184,43 @@ def main(argv: list[str] | None = None) -> None:
     pp = sp.add_parser("paper"); pp.add_argument("--minutes", type=int, default=30); pp.add_argument("--step", type=int, default=5)
     pp.add_argument("--speed", type=float, default=1.0, help="replay speed multiplier"); pp.add_argument("--warmup", type=int, default=1800)
     pp.add_argument("--seed", type=int, default=11); pp.add_argument("-v", "--verbose", action="store_true"); pp.set_defaults(fn=cmd_paper)
+    lv = sp.add_parser("live", help="trade a MetaTrader 5 feed; orders are logged unless --send is set")
+    lv.add_argument("--broker", required=True, choices=("mt5",), help="mt5 uses the official MetaTrader5 package and a local terminal")
+    lv.add_argument("--symbol", default="XAUUSD", help="broker symbol; a RoboForex suffix such as c, .c or m is resolved when the plain name is absent")
+    lv.add_argument("--dry-run", action="store_true", help="log orders and do not send them (this is the default)")
+    lv.add_argument("--send", action="store_true", help="send orders; a demo or contest account only, unless --allow-real is also set")
+    lv.add_argument("--allow-real", action="store_true", help="allow a real-money or cent account; also set MT5_CONFIRM_REAL to the confirmation phrase")
+    lv.add_argument("--step", type=int, default=10, help="seconds between decisions")
+    lv.add_argument("--warmup", type=int, default=1800, help="seconds of book required before the first decision (at least 300)")
+    lv.add_argument("--history", type=int, default=7200, help="seconds kept in the rolling window")
+    lv.add_argument("--lot", type=float, default=0.01, help="full-size lot; 0.01 is the usual cent-account minimum")
+    lv.add_argument("--max-lots", type=float, default=0.05)
+    lv.add_argument("--max-positions", type=int, default=1)
+    lv.add_argument("--max-daily-loss", type=float, default=20.0, help="stop for the day, in account currency (cents on a cent account)")
+    lv.add_argument("--max-spread", type=float, default=80.0, help="skip a new entry when the spread is wider than this, in points")
+    lv.add_argument("--sl-points", type=float, default=0.0, help="stop distance in points; 0 leaves the stop unset")
+    lv.add_argument("--tp-points", type=float, default=0.0, help="take-profit distance in points; 0 leaves it unset")
+    lv.add_argument("--deviation", type=int, default=30, help="slippage allowance in points")
+    lv.add_argument("--kill-file", default="jev.KILL", help="when this file appears, every bot position is closed and the process stops")
+    lv.add_argument("--magic", type=int, default=20261027)
+    lv.add_argument("--hours", choices=("gold", "always"), default="gold", help="gold follows the New York spot session; always disables the filter")
+    lv.add_argument("--levels", type=int, default=5, help="depth levels to keep when the terminal publishes a book")
+    lv.add_argument("-v", "--verbose", action="store_true")
+    lv.set_defaults(fn=cmd_live)
     a = sp.add_parser("ask"); a.add_argument("state"); a.set_defaults(fn=cmd_ask)
     sp.add_parser("models").set_defaults(fn=cmd_models)
     s = sp.add_parser("simulate"); s.add_argument("out"); s.add_argument("--hours", type=int, default=6); s.add_argument("--seed", type=int, default=7)
     s.set_defaults(fn=cmd_simulate)
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     try:
         args.fn(args)
     except JevError as e:
-        sys.exit(f"jev: {e}")
+        from .risk import redact
+        sys.exit(f"jev: {redact(str(e))}")
     except KeyboardInterrupt:
         pass
 

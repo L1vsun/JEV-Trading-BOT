@@ -84,6 +84,19 @@ full at confidence ≥ 0.65 and half otherwise. A position is closed when
 
 Confidence, as TypeSafe documents it for k options, is `(k·p_max − 1)/(k − 1)`.
 
+## Live MT5 book
+
+`jev-bot live` builds the same one-second `Market` the formulas above already
+expect. Bid and ask are the last quote in each second. Trade volume is the
+tick volume, signed by the MT5 tick flags (buy/sell), then by the last price
+against the quote, then by the tick rule. When `market_book_get` returns both
+sides, those sizes fill `bid_sz` / `ask_sz`. With no depth the second is a
+one-level book of equal placeholder size, so queue imbalance, depth imbalance
+and the micro-price go to zero and the order-flow imbalance keeps only the
+sign of quote changes. Trade imbalance, VPIN, Kyle's λ, spread, volatility,
+the candle and the fair-value regression still run; the regression's book
+inputs are flat for as long as that placeholder is in the window.
+
 ## Grading
 
 - Fills one second after the decision at the far side of the book, fee 0.0005 per unit per side.
