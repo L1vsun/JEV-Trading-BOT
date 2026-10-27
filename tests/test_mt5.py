@@ -9,6 +9,8 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
+from zoneinfo import ZoneInfoNotFoundError
 from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -500,6 +502,30 @@ class Hours(_CleanEnv):
         self.assertFalse(gold_session_open(at(2026, 1, 5, 22)))             # daily break, standard time
         self.assertTrue(gold_session_open(at(2026, 1, 5, 22, 30)))
         self.assertTrue(MarketHours("always").is_open(at(2026, 10, 24, 15)))
+
+    def test_missing_time_zone_stops_the_session(self):
+        when = datetime(2026, 10, 26, 16, tzinfo=UTC)
+        with patch("jev_bot.risk.ZoneInfo", side_effect=ZoneInfoNotFoundError("America/New_York")):
+            with self.assertRaises(RiskError) as cm:
+                gold_session_open(when)
+            self.assertIn("America/New_York", str(cm.exception))
+            self.assertIn("tzdata", str(cm.exception))
+            self.assertTrue(MarketHours("always").is_open(when))
+            fake = FakeMT5()
+            session = _session(fake, _cfg(hours="gold", dry_run=False))
+            with self.assertRaises(RiskError) as cm:
+                session.run(max_steps=1)
+            self.assertIn("tzdata", str(cm.exception))
+            self.assertFalse(fake.initialized)
+            self.assertEqual(fake.orders, [])
+            session.broker.connect()
+            with self.assertRaises(RiskError) as cm:
+                session.ensure_allowed()
+            self.assertIn("America/New_York", str(cm.exception))
+            self.assertEqual(fake.orders, [])
+            always = _session(fake, _cfg(hours="always"))
+            always.broker.connect()
+            always.ensure_allowed()
 
 
 class Adapter(_CleanEnv):

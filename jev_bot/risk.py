@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CONFIRM_PHRASE = "YES_TRADE_REAL"
 
@@ -35,11 +35,6 @@ SYMBOL_TRADE_CLOSEONLY = 3
 SYMBOL_TRADE_FULL = 4
 
 _SECRET_ENV = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_PATH", "TYPESAFE_API_KEY")
-_NY: ZoneInfo | None
-try:
-    _NY = ZoneInfo("America/New_York")
-except Exception:
-    _NY = None
 
 
 class RiskError(RuntimeError):
@@ -329,26 +324,34 @@ class KillSwitch:
         return self.path.exists()
 
 
+def require_new_york() -> ZoneInfo:
+    """Load ``America/New_York``.
+
+    The gold session follows that clock, including US daylight saving. A
+    missing database raises :class:`RiskError`. Callers must not replace it
+    with a fixed UTC offset.
+    """
+    try:
+        return ZoneInfo("America/New_York")
+    except ZoneInfoNotFoundError:
+        raise RiskError(
+            "cannot load America/New_York, so the gold session cannot be checked. "
+            "Install the IANA time zone database and start again (on Windows: pip install tzdata)."
+        ) from None
+
+
 def gold_session_open(now: datetime) -> bool:
     """XAUUSD session in New York time: Sunday 17:05 through Friday 16:55.
 
     The daily break is 16:55–17:05 New York. ``zoneinfo`` follows US daylight
-    saving, which is the clock the gold session actually uses. When the
-    timezone data is missing, a fixed UTC approximation (17:00 New York ≈
-    22:00 UTC) is used instead.
+    saving, which is the clock the gold session actually uses.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    if _NY is not None:
-        local = now.astimezone(_NY)
-        wd = local.weekday()
-        minute = local.hour * 60 + local.minute
-        open_at, shut = 17 * 60 + 5, 16 * 60 + 55
-    else:
-        local = now.astimezone(timezone.utc)
-        wd = local.weekday()
-        minute = local.hour * 60 + local.minute
-        open_at, shut = 22 * 60 + 5, 21 * 60 + 55
+    local = now.astimezone(require_new_york())
+    wd = local.weekday()
+    minute = local.hour * 60 + local.minute
+    open_at, shut = 17 * 60 + 5, 16 * 60 + 55
     if wd == 5:
         return False
     if wd == 6:

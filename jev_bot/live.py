@@ -32,6 +32,7 @@ from .risk import (
     loss_breached,
     position_text,
     redact,
+    require_new_york,
 )
 from .typesafe import JevError
 
@@ -105,6 +106,8 @@ class LiveSession:
         self._last_tick_wall: float | None = None
 
     def ensure_allowed(self) -> None:
+        if self.cfg.hours == "gold":
+            require_new_york()
         self.limits.validate()
         if self.cfg.step < 1 or self.cfg.warmup < 300 or self.cfg.history < self.cfg.warmup:
             raise RiskError("step must be >= 1, warmup at least 300 seconds, and history must cover it")
@@ -125,6 +128,8 @@ class LiveSession:
 
     def run(self, max_steps: int | None = None) -> None:
         try:
+            if self.cfg.hours == "gold":
+                require_new_york()
             if not getattr(self.broker, "connected", False):
                 self.broker.connect()
             self.ensure_allowed()

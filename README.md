@@ -201,7 +201,7 @@ Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size
 | `--max-lots` | `0.05` | one order, and the resulting position, cannot be larger |
 | `--max-positions` | `1` | no new entry at the cap; closes are still sent |
 | `--max-daily-loss` | `20` | account currency (cents on a cent account), from 00:00 UTC. At the line, everything this bot opened is closed and the process stops |
-| `--hours gold` | on | XAUUSD session in New York time, with a few minutes of buffer around the daily break. `--hours always` disables the filter |
+| `--hours gold` | on | XAUUSD session on the America/New_York clock, with a few minutes of buffer around the daily break. If that time zone cannot be loaded the session stops before it connects. Windows gets the database from the `tzdata` dependency. `--hours always` disables the filter |
 | `jev.KILL` | `--kill-file` | creating this file closes the bot's positions and stops the process. Ctrl-C does the same |
 | Jev errors, a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |
 
