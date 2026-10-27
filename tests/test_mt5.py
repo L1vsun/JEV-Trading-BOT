@@ -54,6 +54,8 @@ from jev_bot.risk import (
     check_entry,
     gold_session_open,
     loss_breached,
+    parse_avoid_hours,
+    stop_exit,
     normalize_volume,
     read_mt5_credentials,
     redact,
@@ -292,6 +294,9 @@ def _bar(t, bid=2000.0, ask=2000.2, buy=1.0, sell=0.0) -> SecondBar:
 
 def _cfg(**kw) -> LiveConfig:
     lim = {f.name: getattr(RiskLimits(), f.name) for f in fields(RiskLimits)}
+    # These tests predate the tighter live defaults. A test that wants the new
+    # values passes them explicitly, or builds the config from the CLI.
+    lim.update(max_spread_points=80.0, sl_points=0.0, tp_points=0.0, deviation_points=30)
     for key in list(kw):
         if key in lim:
             lim[key] = kw.pop(key)
@@ -299,7 +304,7 @@ def _cfg(**kw) -> LiveConfig:
     # feature_matrix momentum uses a 300-second window, so the first decision needs that much book.
     defaults = dict(
         symbol="XAUUSD", step=1, warmup=320, history=800, hours="always", dry_run=True,
-        allow_real=False, kill_file=kill, magic=20261027, verbose=False,
+        allow_real=False, kill_file=kill, magic=20261027, verbose=False, max_hold_seconds=0,
     )
     defaults.update(kw)
     defaults["limits"] = RiskLimits(**lim)
@@ -443,7 +448,7 @@ class Orders(_CleanEnv):
         self.assertEqual((buy.price, buy.sl, buy.tp, buy.deviation, buy.filling), (2000.2, 1999.2, 2002.2, 30, ORDER_FILLING_FOK))
         sell = build_order(-1, 0.02, _spec(), RiskLimits(sl_points=100, tp_points=50, lot=0.02))
         self.assertEqual((sell.price, sell.sl, sell.tp), (2000.0, 2001.0, 1999.5))
-        wide = build_order(1, 0.01, _spec(stops_level=20), RiskLimits(sl_points=5))
+        wide = build_order(1, 0.01, _spec(stops_level=20), RiskLimits(sl_points=5, tp_points=0))
         self.assertTrue(wide.stops_adjusted)
         self.assertAlmostEqual(wide.sl, 2000.0)
         self.assertEqual(wide.tp, 0.0)
@@ -1171,6 +1176,322 @@ class Cli(_CleanEnv):
         self.assertIn("level-1 fallback", readme)
         self.assertIn("queue imbalance", readme)
         self.assertIn("RoboForex", readme)
+
+
+def _live_args(*extra):
+    argv = ["live", "--broker", "mt5", "--hours", "always", "--warmup", "320", "--history", "800", "--step", "1", *extra]
+    return build_parser().parse_args(argv)
+
+
+def _sell_response():
+    response = _response()
+    response.answers["regime"] = Answer.from_json({
+        "type": "choice", "choice": "trending_down",
+        "probabilities": {"trending_up": 0.05, "trending_down": 0.8, "ranging": 0.1, "disorderly": 0.05},
+        "confidence": 0.7,
+    })
+    response.answers["flow_control"] = Answer.from_json({
+        "type": "choice", "choice": "sellers",
+        "probabilities": {"buyers": 0.05, "sellers": 0.9, "neither": 0.05}, "confidence": 0.85,
+    })
+    response.answers["book_pressure"] = Answer.from_json({
+        "type": "choice", "choice": "down",
+        "probabilities": {"up": 0.1, "down": 0.8, "neutral": 0.1}, "confidence": 0.7,
+    })
+    response.answers["candle_close"] = Answer.from_json({
+        "type": "choice", "choice": "down",
+        "probabilities": {"up": 0.1, "down": 0.7, "unclear": 0.2}, "confidence": 0.55,
+    })
+    raw = {"type": "choice", "choice": "sell", "probabilities": {"buy": 0.02, "sell": 0.9, "hold": 0.08}, "confidence": 0.85}
+    for key in ("action", "action_alt", "action_contrarian_check"):
+        response.answers[key] = Answer.from_json(raw)
+    return response
+
+
+class LiveDefaults(_CleanEnv):
+    def _session_from(self, *extra, fake=None, jev=None, dry_send=False):
+        args = _live_args(*extra)
+        cfg = live_config_from_args(args)
+        cfg.kill_file = str(Path(tempfile.mkdtemp()) / "jev.KILL")
+        if dry_send:
+            cfg.dry_run = False
+        fake = fake or FakeMT5()
+        return _ready(fake, cfg, jev), fake
+
+    def test_cli_defaults_and_zero_still_means_off(self):
+        cfg = live_config_from_args(build_parser().parse_args(["live", "--broker", "mt5"]))
+        self.assertEqual(cfg.limits.max_spread_points, 30)
+        self.assertEqual(cfg.limits.sl_points, 200)
+        self.assertEqual(cfg.limits.tp_points, 400)
+        self.assertEqual(cfg.limits.deviation_points, 15)
+        self.assertEqual(cfg.max_hold_seconds, 900)
+        self.assertIsNone(cfg.avoid)
+        self.assertTrue(cfg.dry_run)
+        off = live_config_from_args(_live_args(
+            "--max-spread", "80", "--sl-points", "0", "--tp-points", "0", "--deviation", "30",
+            "--max-hold-seconds", "0", "--avoid-hours", "off",
+        ))
+        self.assertEqual((off.limits.sl_points, off.limits.tp_points, off.max_hold_seconds), (0, 0, 0))
+        self.assertIsNone(off.avoid)
+        flat = build_order(1, 0.01, _spec(), off.limits)
+        self.assertEqual((flat.sl, flat.tp, flat.deviation), (0.0, 0.0, 30))
+        with self.assertRaises(RiskError):
+            live_config_from_args(_live_args("--avoid-hours", "afternoon"))
+        with self.assertRaises(RiskError):
+            live_config_from_args(_live_args("--avoid-hours", "13:00-13:00"))
+        with self.assertRaises(RiskError):
+            live_config_from_args(_live_args("--max-hold-seconds", "-1"))
+        buf = io.StringIO()
+        with redirect_stdout(buf), self.assertRaises(SystemExit):
+            build_parser().parse_args(["live", "--help"])
+        help_text = buf.getvalue()
+        self.assertIn("--max-hold-seconds", help_text)
+        self.assertIn("--avoid-hours", help_text)
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        self.assertIn("--max-hold-seconds", readme)
+        self.assertIn("--avoid-hours", readme)
+        self.assertIn("13:00-17:00", readme)
+        self.assertIn("default to 200 and 400", readme)
+
+    def test_header_prints_the_effective_values(self):
+        session, _fake = self._session_from()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session._announce()
+        text = buf.getvalue()
+        for line in (
+            "max_spread 30", "sl_points 200", "tp_points 400", "deviation 15",
+            "max_hold_seconds 900", "avoid_hours off", "max_positions 1", "max_daily_loss 20",
+        ):
+            self.assertIn(line, text)
+        session, _fake = self._session_from(
+            "--sl-points", "0", "--tp-points", "0", "--max-hold-seconds", "0",
+            "--avoid-hours", "13:00-17:00", "--max-spread", "40", "--deviation", "20",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session._announce()
+        text = buf.getvalue()
+        self.assertIn("sl_points off", text)
+        self.assertIn("tp_points off", text)
+        self.assertIn("max_hold_seconds off", text)
+        self.assertIn("avoid_hours 13:00-17:00 Europe/Berlin", text)
+        self.assertIn("max_spread 40", text)
+        self.assertIn("deviation 20", text)
+
+    def test_stop_prices_follow_berlin_daylight_and_wrap_midnight(self):
+        hit = stop_exit(1, 1998.2, 1998.4, 1998.2, 2004.2)
+        self.assertEqual(hit, ("stop loss", 1998.2))
+        self.assertEqual(stop_exit(1, 2004.2, 2004.4, 1998.2, 2004.2), ("take profit", 2004.2))
+        self.assertIsNone(stop_exit(1, 2000.0, 2000.2, 1998.2, 2004.2))
+        self.assertEqual(stop_exit(1, 1990.0, 1990.2, 1998.2, 2004.2)[0], "stop loss")
+        self.assertIsNone(stop_exit(1, 1990.0, 1990.2, 0.0, 0.0))
+        self.assertEqual(stop_exit(-1, 2001.8, 2002.0, 2002.0, 1996.0), ("stop loss", 2002.0))
+        self.assertEqual(stop_exit(-1, 1995.8, 1996.0, 2002.0, 1996.0), ("take profit", 1996.0))
+        window = parse_avoid_hours("13:00-17:00")
+        self.assertTrue(window.blocks(datetime(2026, 10, 27, 12, 30, tzinfo=UTC)))
+        self.assertFalse(window.blocks(datetime(2026, 10, 27, 16, 0, tzinfo=UTC)))
+        self.assertTrue(window.blocks(datetime(2026, 7, 15, 11, 30, tzinfo=UTC)))
+        self.assertFalse(window.blocks(datetime(2026, 7, 15, 10, 30, tzinfo=UTC)))
+        wrapped = parse_avoid_hours("22:00-02:00")
+        self.assertTrue(wrapped.blocks(datetime(2026, 1, 15, 21, 30, tzinfo=UTC)))
+        self.assertTrue(wrapped.blocks(datetime(2026, 1, 15, 0, 30, tzinfo=UTC)))
+        self.assertFalse(wrapped.blocks(datetime(2026, 1, 15, 12, 0, tzinfo=UTC)))
+
+    def test_dry_run_stop_and_target_match_the_broker_prices(self):
+        session, fake = self._session_from("--step", "10")
+        t = _prefill(session)
+        now = datetime(2026, 10, 27, 10, tzinfo=UTC)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t), now)
+        self.assertIn("sl=1998.20", buf.getvalue())
+        self.assertIn("tp=2004.20", buf.getvalue())
+        self.assertEqual(fake.orders, [])
+        self.assertEqual(session.position, 1)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1, bid=1998.2, ask=1998.4), now)
+        text = buf.getvalue()
+        self.assertIn("DRY-RUN EXIT @ 1998.20 (stop loss) pnl -2.00", text)
+        self.assertEqual(session.position, 0)
+        self.assertEqual(fake.orders, [])
+        self.assertEqual(len(session.jev.states), 1)
+
+        session, fake = self._session_from("--step", "10")
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1, bid=2004.2, ask=2004.4), now)
+        self.assertIn("DRY-RUN EXIT @ 2004.20 (take profit) pnl +4.00", buf.getvalue())
+        self.assertEqual(session.position, 0)
+
+        session, fake = self._session_from("--step", "10", jev=ScriptedJev([_sell_response()]))
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        self.assertEqual(session.position, -1)
+        self.assertAlmostEqual(session.tp, 1996.0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1, bid=1995.8, ask=1996.0), now)
+        self.assertIn("DRY-RUN EXIT @ 1996.00 (take profit)", buf.getvalue())
+        self.assertEqual(session.position, 0)
+
+    def test_dry_run_uses_the_widened_stop_and_ignores_a_disabled_stop(self):
+        fake = FakeMT5()
+        fake.symbols["XAUUSD"] = _symbol(trade_stops_level=20)
+        session, _fake = self._session_from("--sl-points", "5", "--tp-points", "0", fake=fake)
+        t = _prefill(session)
+        now = datetime(2026, 10, 27, 10, tzinfo=UTC)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t), now)
+        self.assertIn("stops widened", buf.getvalue())
+        self.assertAlmostEqual(session.sl, 2000.0)
+        self.assertEqual(session.tp, 0.0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1, bid=2000.0, ask=2000.2), now)
+        self.assertIn("DRY-RUN EXIT @ 2000.00 (stop loss)", buf.getvalue())
+
+        session, fake = self._session_from("--sl-points", "0", "--tp-points", "0", "--max-hold-seconds", "0")
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1, bid=1990.0, ask=1990.2), now)
+        self.assertNotIn("stop loss", buf.getvalue())
+        self.assertEqual(session.position, 1)
+        self.assertEqual(fake.orders, [])
+
+    def test_live_stop_is_on_the_order_and_a_crossed_level_closes(self):
+        session, fake = self._session_from(dry_send=True)
+        t = _prefill(session)
+        now = datetime(2026, 10, 27, 10, tzinfo=UTC)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        req = fake.orders[0]
+        self.assertAlmostEqual(req["sl"], 1998.2)
+        self.assertAlmostEqual(req["tp"], 2004.2)
+        self.assertEqual(req["deviation"], 15)
+        self.assertEqual(session.position, 1)
+        # The stop rests at the broker. A crossed quote does not send a second order.
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t + 1, bid=1998.2, ask=1998.4), now)
+        self.assertEqual(len(fake.orders), 1)
+        self.assertEqual(session.position, 1)
+        fake.positions.clear()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 2, bid=1998.0, ask=1998.2), now)
+        self.assertIn("EXIT @ 1998.20 (stop loss)", buf.getvalue())
+        self.assertEqual(len(fake.orders), 1)
+        self.assertEqual(session.position, 0)
+
+    def test_max_hold_closes_in_dry_run_and_live(self):
+        now = datetime(2026, 10, 27, 10, tzinfo=UTC)
+        session, fake = self._session_from("--sl-points", "0", "--tp-points", "0", "--max-hold-seconds", "900")
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        # A hole in the feed would wipe the warmup, so the clock is moved
+        # under a continuous bar instead of skipping 900 seconds of quotes.
+        session.t_in = (t + 1) - 899
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t + 1), now)
+        self.assertEqual(session.position, 1)
+        session.t_in = (t + 2) - 900
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 2), now)
+        self.assertIn("DRY-RUN EXIT @ 2000.00 (max hold 900s)", buf.getvalue())
+        self.assertEqual(session.position, 0)
+        self.assertEqual(fake.orders, [])
+
+        session, fake = self._session_from(
+            "--sl-points", "0", "--tp-points", "0", "--max-hold-seconds", "900", dry_send=True,
+        )
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), now)
+        session.t_in = (t + 1) - 900
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1), now)
+        self.assertIn("EXIT (max hold 900s)", buf.getvalue())
+        self.assertEqual(fake.orders[1]["type"], 1)
+        self.assertEqual(fake.orders[1]["deviation"], 15)
+        self.assertEqual(session.position, 0)
+
+    def test_avoid_hours_blocks_entries_and_leaves_open_positions(self):
+        outside = datetime(2026, 10, 27, 10, tzinfo=UTC)
+        inside = datetime(2026, 10, 27, 12, 30, tzinfo=UTC)
+        session, fake = self._session_from("--avoid-hours", "13:00-17:00", "--sl-points", "0", "--tp-points", "0")
+        t = _prefill(session)
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t), outside)
+        self.assertEqual(session.position, 1)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 1), inside)
+        self.assertNotIn("EXIT", buf.getvalue())
+        self.assertNotIn("flatten", buf.getvalue())
+        self.assertEqual(session.position, 1)
+        self.assertEqual(fake.orders, [])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 2), inside)
+        # still long, and a fresh buy is not a new entry
+        self.assertEqual(session.position, 1)
+
+        session.jev = ScriptedJev([_sell_response()])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t + 3), inside)
+        text = buf.getvalue()
+        self.assertIn("DRY-RUN EXIT", text)
+        self.assertIn("blocked: avoid hours 13:00-17:00 Europe/Berlin", text)
+        self.assertEqual(session.position, 0)
+
+        session, fake = self._session_from("--avoid-hours", "13:00-17:00")
+        t = _prefill(session)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t), inside)
+        self.assertIn("blocked: avoid hours 13:00-17:00 Europe/Berlin", buf.getvalue())
+        self.assertEqual(session.position, 0)
+        self.assertEqual(fake.orders, [])
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t + 1), outside)
+        self.assertEqual(session.position, 1)
+
+    def test_missing_berlin_zone_stops_before_connect(self):
+        cfg = live_config_from_args(_live_args("--avoid-hours", "13:00-17:00"))
+        fake = FakeMT5()
+        session = _session(fake, cfg)
+        with patch("jev_bot.risk.ZoneInfo", side_effect=ZoneInfoNotFoundError("Europe/Berlin")):
+            with self.assertRaises(RiskError) as cm:
+                session.run(max_steps=1)
+            self.assertIn("Europe/Berlin", str(cm.exception))
+            self.assertIn("tzdata", str(cm.exception))
+            self.assertFalse(fake.initialized)
+            self.assertEqual(fake.orders, [])
+
+    def test_default_spread_cap_blocks_a_50_point_quote(self):
+        session, fake = self._session_from()
+        t = _prefill(session)
+        fake.quote["ask"] = 2000.5
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.on_bar(_bar(t, bid=2000.0, ask=2000.5), datetime(2026, 10, 27, 10, tzinfo=UTC))
+        self.assertIn("spread", buf.getvalue())
+        self.assertEqual(session.position, 0)
+        self.assertEqual(fake.orders, [])
 
 
 def _leaves(obj):

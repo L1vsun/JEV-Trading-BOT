@@ -191,8 +191,9 @@ jev-bot live --broker mt5 --dry-run
 Dry-run is the default, including when you pass `--dry-run` explicitly. Orders are printed and the terminal's `order_send` is not called.
 
 ```bash
-jev-bot live --broker mt5 --dry-run          # log only
+jev-bot live --broker mt5 --dry-run          # log only; spread 30, stop 200, target 400, hold 900s
 jev-bot live --broker mt5 --send             # demo or contest account
+jev-bot live --broker mt5 --dry-run --avoid-hours 13:00-17:00
 ```
 
 A real-money account, **including a cent account**, needs both the flag and the confirmation phrase:
@@ -202,7 +203,13 @@ export MT5_CONFIRM_REAL=YES_TRADE_REAL
 jev-bot live --broker mt5 --send --allow-real
 ```
 
-Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size is half of `--lot` and is skipped when that is below the broker's volume step (use `--lot 0.02` when the minimum is `0.01` and you want the half-size rung). Volume is snapped down to the step, entries wider than `--max-spread` (points) are skipped, and the filling mode follows the symbol: market and exchange execution use `RETURN`, instant execution uses `FOK` or `IOC` as the symbol allows. `--deviation` is the slippage in points. `--sl-points` and `--tp-points` are optional; `0` leaves that side unset, and a stop closer than the broker minimum is widened to it. Buys pay the ask, sells hit the bid.
+Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size is half of `--lot` and is skipped when that is below the broker's volume step (use `--lot 0.02` when the minimum is `0.01` and you want the half-size rung). Volume is snapped down to the step, entries wider than `--max-spread` (points, default 30) are skipped, and the filling mode follows the symbol: market and exchange execution use `RETURN`, instant execution uses `FOK` or `IOC` as the symbol allows. `--deviation` (default 15) is the slippage in points. Buys pay the ask, sells hit the bid.
+
+`--sl-points` and `--tp-points` default to 200 and 400. `0` still leaves that side unset. The distance is widened to the broker's minimum stop level when it is closer, and the price is rounded to the symbol's digits. Live orders send those prices as the position's stop loss and take profit, and the log names `stop loss` or `take profit` when the terminal reports the position closed. Dry-run watches the same prices without sending: a long exits on the bid, a short on the ask, at that rounded price. A quote that crosses both levels takes the stop.
+
+`--max-hold-seconds` defaults to 900. When an open position has been held that long it is closed, in dry-run and live, and the log says `max hold 900s`. The process keeps running. `0` disables the limit.
+
+`--avoid-hours` is off unless you set it. `13:00-17:00` blocks new entries from 13:00 inclusive to 17:00 exclusive in Europe/Berlin, which is the London and New York overlap in local time, including daylight saving. A window that passes midnight (`22:00-02:00`) wraps. Positions already open are left alone: Jev can still exit them, and the stop, the hold limit, the daily loss and the kill file still apply. The startup lines print every effective value, including a control that is off.
 
 ### Limits
 
@@ -211,9 +218,16 @@ Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size
 | `--max-lots` | `0.05` | one order, and the resulting position, cannot be larger |
 | `--max-positions` | `1` | no new entry at the cap; closes are still sent |
 | `--max-daily-loss` | `20` | account currency (cents on a cent account), from 00:00 UTC. At the line, everything this bot opened is closed and the process stops |
-| `--hours gold` | on | XAUUSD session on the America/New_York clock, with a few minutes of buffer around the daily break. If that time zone cannot be loaded the session stops before it connects. Windows gets the database from the `tzdata` dependency. `--hours always` disables the filter |
+| `--max-spread` | `30` | skip a new entry when the spread is wider, in points |
+| `--sl-points` | `200` | broker stop, and the same exit in dry-run. `0` leaves it unset |
+| `--tp-points` | `400` | broker take-profit, and the same exit in dry-run. `0` leaves it unset |
+| `--deviation` | `15` | slippage allowance in points |
+| `--max-hold-seconds` | `900` | close the open position after this many seconds. `0` disables it. The session stays up |
+| `--avoid-hours` | off | `HH:MM-HH:MM` in Europe/Berlin. Blocks new entries only. `13:00-17:00` skips the London/New York overlap |
+| `--hours gold` | on | XAUUSD session on the America/New_York clock, with a few minutes of buffer around the daily break. If that time zone cannot be loaded the session stops before it connects. Windows gets the database from the `tzdata` dependency. `--hours always` disables the filter. `--avoid-hours` needs Europe/Berlin the same way, and only when the option is set |
 | `jev.KILL` | `--kill-file` | creating this file closes the bot's positions and stops the process. Ctrl-C does the same |
-| Jev errors, a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |
+| a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |
+| Jev API errors | | hold that bar. No order, and the process stays up |
 
 Closes use the bot's magic number (`--magic`, default `20261027`) on the configured symbol. Other positions on the account are left alone. A symbol the terminal marks close-only or disabled is not opened.
 

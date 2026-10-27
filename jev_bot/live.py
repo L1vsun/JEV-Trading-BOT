@@ -2,8 +2,8 @@
 
 ``features.py``, ``state.py`` and ``decide.py`` are used as they are. The
 only difference from ``cmd_paper`` is where the one-second book comes from
-and where an order goes. A Jev error or a lost terminal flattens and stops;
-the paper loop merely skips the tick.
+and where an order goes. A lost terminal flattens and stops. A Jev error
+holds that bar and leaves the loop running.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .quant import FairValueModel
 from .questions import decision_questions
 from .state import StateBuilder
 from .risk import (
+    AvoidHours,
     ConnectionLost,
     KillSwitch,
     MarketHours,
@@ -30,9 +31,12 @@ from .risk import (
     check_entry,
     format_intent,
     loss_breached,
+    parse_avoid_hours,
     position_text,
     redact,
+    require_berlin,
     require_new_york,
+    stop_exit,
 )
 from .typesafe import JevError
 
@@ -43,6 +47,13 @@ def describe_model(jev) -> str:
     if str(name).startswith("surrogate"):
         return f"{name} (offline stand-in, not Jev)"
     return f"{name} (TypeSafe Jev)"
+
+
+def _shown(name: str, value: float) -> str:
+    """Header text. Zero means that control is off."""
+    if value <= 0:
+        return f"{name} off"
+    return f"{name} {value:g}"
 
 
 def mark_depth(state: dict, available: bool) -> dict:
@@ -89,6 +100,8 @@ class LiveConfig:
     max_gap: int = 10
     hours: str = "gold"
     verbose: bool = False
+    max_hold_seconds: int = 900
+    avoid: AvoidHours | None = None
     limits: RiskLimits = field(default_factory=RiskLimits)
 
 
@@ -101,6 +114,10 @@ def live_config_from_args(args) -> LiveConfig:
         deviation_points=args.deviation,
     )
     limits.validate()
+    hold = int(getattr(args, "max_hold_seconds", 900))
+    if hold < 0:
+        raise RiskError("max_hold_seconds must be >= 0")
+    avoid = parse_avoid_hours(getattr(args, "avoid_hours", None))
     if args.step < 1 or args.warmup < 300:
         raise RiskError("step must be >= 1 and warmup must be at least 300 seconds")
     if args.history < args.warmup:
@@ -111,7 +128,7 @@ def live_config_from_args(args) -> LiveConfig:
         symbol=args.symbol, step=args.step, warmup=args.warmup, history=args.history,
         levels=args.levels, dry_run=not bool(args.send), allow_real=bool(args.allow_real),
         kill_file=args.kill_file, magic=args.magic, hours=args.hours, verbose=bool(args.verbose),
-        limits=limits,
+        max_hold_seconds=hold, avoid=avoid, limits=limits,
     )
 
 
@@ -134,6 +151,8 @@ class LiveSession:
         self.qty = 0.0
         self.px_in = 0.0
         self.t_in = 0
+        self.sl = 0.0
+        self.tp = 0.0
         self.realized = 0.0
         self.last_msc = 0
         self._contract = 0.0
@@ -145,7 +164,11 @@ class LiveSession:
     def ensure_allowed(self) -> None:
         if self.cfg.hours == "gold":
             require_new_york()
+        if self.cfg.avoid is not None:
+            require_berlin()
         self.limits.validate()
+        if self.cfg.max_hold_seconds < 0:
+            raise RiskError("max_hold_seconds must be >= 0")
         if self.cfg.step < 1 or self.cfg.warmup < 300 or self.cfg.history < self.cfg.warmup:
             raise RiskError("step must be >= 1, warmup at least 300 seconds, and history must cover it")
         if not 1 <= self.cfg.levels <= 10:
@@ -167,6 +190,8 @@ class LiveSession:
         try:
             if self.cfg.hours == "gold":
                 require_new_york()
+            if self.cfg.avoid is not None:
+                require_berlin()
             if not getattr(self.broker, "connected", False):
                 self.broker.connect()
             self.ensure_allowed()
@@ -191,11 +216,19 @@ class LiveSession:
     def _announce(self) -> None:
         spec = self.broker.spec()
         mode = "DRY-RUN" if self.cfg.dry_run else "SEND"
+        avoid = "off" if self.cfg.avoid is None else f"{self.cfg.avoid.text} Europe/Berlin"
         self._log(
             f"live · mt5 · {self.broker.symbol} · {mode} · model {describe_model(self.jev)} · "
-            f"contract {spec.contract_size:g} · point {spec.point:g} · lot {self.limits.lot:g} · "
-            f"max_lots {self.limits.max_lots:g} · max_daily_loss {self.limits.max_daily_loss:g} · "
             f"{self.broker.describe()}"
+        )
+        self._log(
+            f"limits · lot {self.limits.lot:g} · max_lots {self.limits.max_lots:g} · "
+            f"max_positions {self.limits.max_positions} · max_daily_loss {self.limits.max_daily_loss:g} · "
+            f"max_spread {self.limits.max_spread_points:g} · {_shown('sl_points', self.limits.sl_points)} · "
+            f"{_shown('tp_points', self.limits.tp_points)} · deviation {self.limits.deviation_points} · "
+            f"{_shown('max_hold_seconds', self.cfg.max_hold_seconds)} · avoid_hours {avoid} · "
+            f"hours {self.cfg.hours} · step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
+            f"contract {spec.contract_size:g} · point {spec.point:g}"
         )
         if str(getattr(self.jev, "model", "")).startswith("surrogate"):
             if (os.environ.get("TYPESAFE_API_KEY") or "").strip():
@@ -297,9 +330,11 @@ class LiveSession:
         if not self._warm_logged:
             self._warm_logged = True
             self._log(f"warmup done · {len(self.buffer)}s in the window")
+        if self._protect(bar):
+            return None
         if bar.t % self.cfg.step != 0:
             return None
-        return self._decide(bar)
+        return self._decide(bar, now)
 
     def pnl(self, bar) -> float:
         if not self.cfg.dry_run:
@@ -324,12 +359,19 @@ class LiveSession:
         else:
             self.position = 1 if exp.net > 0 else -1
 
+    def _clear_stops(self) -> None:
+        self.sl = 0.0
+        self.tp = 0.0
+        self.t_in = 0
+        self.px_in = 0.0
+
     def flatten(self, reason: str) -> None:
         self._log(f"flatten: {reason}")
         if self.cfg.dry_run:
             if self.position:
                 self.position = 0
                 self.qty = 0.0
+            self._clear_stops()
             return
         try:
             reports = self.broker.close_all()
@@ -339,12 +381,52 @@ class LiveSession:
         for rep in reports:
             if not rep.ok:
                 self._log(f"flatten: close rejected retcode={rep.retcode}")
+        self._clear_stops()
         try:
             self.sync()
         except ConnectionLost:
             self._log("flatten: terminal already gone")
 
-    def _decide(self, bar):
+    def _protect(self, bar) -> bool:
+        """Close on a stop or the hold limit. True means this bar is done.
+
+        Dry-run fills the stop at the same rounded price the order would have
+        carried. Live leaves that stop on the position and only logs it once
+        the terminal reports the position gone, so a market close cannot race
+        the broker fill. The hold limit is ours in both modes.
+        """
+        if not self.cfg.dry_run:
+            side, sl, tp = self.position, self.sl, self.tp
+            self.sync()
+            if side and not self.position:
+                hit = stop_exit(side, bar.bid, bar.ask, sl, tp)
+                reason = hit[0] if hit else "broker close"
+                px = hit[1] if hit else None
+                self.qty = 0.0
+                self._clear_stops()
+                price = f" @ {px:.2f}" if px is not None else ""
+                self._log(f"EXIT{price} ({reason})")
+                return True
+        if not self.position:
+            return False
+        if self.t_in == 0:
+            self.t_in = bar.t
+            if not self.px_in:
+                self.px_in = bar.bid if self.position > 0 else bar.ask
+            return False
+        if self.cfg.dry_run:
+            hit = stop_exit(self.position, bar.bid, bar.ask, self.sl, self.tp)
+            if hit:
+                reason, px = hit
+                self._log(self._close(bar, reason, px=px))
+                return True
+        limit = self.cfg.max_hold_seconds
+        if limit and bar.t - self.t_in >= limit:
+            self._log(self._close(bar, f"max hold {limit}s"))
+            return True
+        return False
+
+    def _decide(self, bar, now: datetime):
         self.sync()
         if not self.cfg.dry_run and self.position and self.t_in == 0:
             self.t_in = bar.t
@@ -374,7 +456,7 @@ class LiveSession:
             self._answered = True
             self._log(f"first answer · model {response.model}")
         decision = decide(len(self.buffer) - 1, response, self.position)
-        line = self._act(decision, bar)
+        line = self._act(decision, bar, now)
         if line and (self.cfg.verbose or not line.startswith("hold")):
             self._log(line)
         if loss_breached(self.pnl(bar), self.limits.max_daily_loss):
@@ -382,7 +464,7 @@ class LiveSession:
             raise TradingHalted("daily loss limit")
         return decision
 
-    def _act(self, decision, bar) -> str:
+    def _act(self, decision, bar, now: datetime) -> str:
         lines = []
         closing = self.position and (
             decision.action == "exit"
@@ -391,26 +473,34 @@ class LiveSession:
         if closing:
             lines.append(self._close(bar, decision.reason))
         if decision.action in ("buy", "sell") and self.position == 0:
-            lines.append(self._open(1 if decision.action == "buy" else -1, decision, bar))
+            lines.append(self._open(1 if decision.action == "buy" else -1, decision, bar, now))
         if not lines:
             return f"hold {decision.reason}"
         return " | ".join(x for x in lines if x)
 
-    def _close(self, bar, reason: str) -> str:
+    def _close(self, bar, reason: str, px: float | None = None) -> str:
         if self.cfg.dry_run:
-            px = bar.bid if self.position > 0 else bar.ask
+            if px is None:
+                px = bar.bid if self.position > 0 else bar.ask
             self.realized += (px - self.px_in) * self.position * self.qty * (self._contract or 1.0)
             self.position = 0
             self.qty = 0.0
+            self._clear_stops()
             return f"DRY-RUN EXIT @ {px:.2f} ({reason}) pnl {self.realized:+.2f}"
         reports = self.broker.close_all()
         self.sync()
         bad = [r for r in reports if not r.ok]
-        if bad:
-            return f"EXIT rejected retcode={bad[0].retcode} ({reason})"
-        return f"EXIT ({reason})"
+        if self.position or bad:
+            code = bad[0].retcode if bad else 0
+            return f"EXIT rejected retcode={code} ({reason})"
+        shown = f" @ {px:.2f}" if px is not None else ""
+        self.qty = 0.0
+        self._clear_stops()
+        return f"EXIT{shown} ({reason})"
 
-    def _open(self, side: int, decision, bar) -> str:
+    def _open(self, side: int, decision, bar, now: datetime) -> str:
+        if self.cfg.avoid is not None and self.cfg.avoid.blocks(now):
+            return f"blocked: avoid hours {self.cfg.avoid.text} Europe/Berlin"
         try:
             spec = self.broker.spec()
             self._contract = spec.contract_size or self._contract or 1.0
@@ -428,6 +518,8 @@ class LiveSession:
             self.qty = intent.volume
             self.px_in = intent.price
             self.t_in = bar.t
+            self.sl = intent.sl
+            self.tp = intent.tp
             return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=True)
         try:
             report = self.broker.send(intent)
@@ -439,6 +531,8 @@ class LiveSession:
         if self.position:
             self.px_in = report.price or intent.price
             self.t_in = bar.t
+            self.sl = intent.sl
+            self.tp = intent.tp
         return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False) + f" retcode={report.retcode}"
 
     def _log(self, msg: str) -> None:

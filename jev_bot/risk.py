@@ -112,11 +112,11 @@ class RiskLimits:
     max_lots: float = 0.05
     max_positions: int = 1
     max_daily_loss: float = 20.0          # account currency (USC on a cent account)
-    max_spread_points: float = 80.0
+    max_spread_points: float = 30.0
     lot: float = 0.01                      # full-size order; half size is lot/2
-    sl_points: float = 0.0                 # 0 = no stop
-    tp_points: float = 0.0
-    deviation_points: int = 30             # slippage allowance, in points
+    sl_points: float = 200.0               # 0 = no stop
+    tp_points: float = 400.0               # 0 = no take profit
+    deviation_points: int = 15             # slippage allowance, in points
 
     def validate(self) -> None:
         if self.max_lots <= 0:
@@ -322,6 +322,95 @@ class KillSwitch:
 
     def tripped(self) -> bool:
         return self.path.exists()
+
+
+def stop_exit(side: int, bid: float, ask: float, sl: float, tp: float) -> tuple[str, float] | None:
+    """Return ``(reason, price)`` when the exit side has traded through a stop.
+
+    A long is sold on the bid and a short is covered on the ask, which is how
+    a broker stop on that position fills. Stop loss wins when one quote crosses
+    both levels. A price of 0 means that side is off.
+    """
+    if side > 0:
+        if sl > 0 and bid <= sl:
+            return "stop loss", sl
+        if tp > 0 and bid >= tp:
+            return "take profit", tp
+    elif side < 0:
+        if sl > 0 and ask >= sl:
+            return "stop loss", sl
+        if tp > 0 and ask <= tp:
+            return "take profit", tp
+    return None
+
+
+@dataclass(frozen=True)
+class AvoidHours:
+    """A clock window in Europe/Berlin during which new entries are refused.
+
+    The end minute is exclusive, so ``13:00-17:00`` blocks 13:00 and allows
+    17:00. A window that passes midnight, such as ``22:00-02:00``, wraps.
+    Existing positions are not closed because of this window.
+    """
+
+    start: int
+    end: int
+    text: str
+
+    def blocks(self, now: datetime) -> bool:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        local = now.astimezone(require_berlin())
+        minute = local.hour * 60 + local.minute
+        if self.start < self.end:
+            return self.start <= minute < self.end
+        return minute >= self.start or minute < self.end
+
+
+def parse_avoid_hours(text: str | None) -> AvoidHours | None:
+    """Parse ``HH:MM-HH:MM``. Empty, ``off`` and ``none`` mean the filter is off."""
+    raw = (text or "").strip()
+    if not raw or raw.lower() in ("off", "none"):
+        return None
+    parts = raw.split("-")
+    if len(parts) != 2:
+        raise RiskError("avoid-hours must look like 13:00-17:00")
+
+    def mins(piece: str) -> int:
+        piece = piece.strip()
+        if piece.count(":") != 1:
+            raise RiskError("avoid-hours must look like 13:00-17:00")
+        hour, minute = piece.split(":", 1)
+        if not hour.isdigit() or not minute.isdigit() or len(minute) != 2:
+            raise RiskError("avoid-hours must look like 13:00-17:00")
+        hh, mm = int(hour), int(minute)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise RiskError("avoid-hours must look like 13:00-17:00")
+        return hh * 60 + mm
+
+    start, end = mins(parts[0]), mins(parts[1])
+    if start == end:
+        raise RiskError("avoid-hours start and end are the same")
+
+    def fmt(n: int) -> str:
+        return f"{n // 60:02d}:{n % 60:02d}"
+
+    return AvoidHours(start, end, f"{fmt(start)}-{fmt(end)}")
+
+
+def require_berlin() -> ZoneInfo:
+    """Load ``Europe/Berlin`` for ``--avoid-hours``.
+
+    A missing database raises :class:`RiskError`. The filter is not replaced
+    with a fixed UTC offset, because Berlin daylight saving moves the window.
+    """
+    try:
+        return ZoneInfo("Europe/Berlin")
+    except ZoneInfoNotFoundError:
+        raise RiskError(
+            "cannot load Europe/Berlin, so --avoid-hours cannot be checked. "
+            "Install the IANA time zone database and start again (on Windows: pip install tzdata)."
+        ) from None
 
 
 def require_new_york() -> ZoneInfo:

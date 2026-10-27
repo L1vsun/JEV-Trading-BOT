@@ -83,7 +83,7 @@ class OrderReport:
 
 
 class MT5Broker:
-    def __init__(self, symbol: str = "XAUUSD", magic: int = 20261027, deviation: int = 30,
+    def __init__(self, symbol: str = "XAUUSD", magic: int = 20261027, deviation: int = 15,
                  mt5=None, loader=None, clock=None):
         if not _SYMBOL_RE.fullmatch(symbol or ""):
             raise SymbolError("invalid symbol")
