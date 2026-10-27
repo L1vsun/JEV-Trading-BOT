@@ -247,9 +247,13 @@ class MT5Broker:
         """Naive local datetime the terminal reads as this UTC instant on the broker clock.
 
         ``datetime.timestamp`` of the result is ``real_unix + server_offset``.
-        That is the number stored in tick times.
+        That is the number stored in tick times. Windows rejects timestamps
+        before the Unix epoch, so a lookback that would cross 1970 is clamped.
         """
-        return datetime.fromtimestamp(real_unix + self.server_offset)
+        stamp = real_unix + self.server_offset
+        if stamp < 0:
+            stamp = 0.0
+        return datetime.fromtimestamp(stamp)
 
     def _to_utc(self, ticks: list[Tick]) -> list[Tick]:
         delta = self.server_offset * 1000

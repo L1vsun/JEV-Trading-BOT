@@ -19,8 +19,9 @@ from types import SimpleNamespace
 import numpy as np
 
 from jev_bot import features as F
-from jev_bot.cli import build_parser
-from jev_bot.live import LiveConfig, LiveSession, live_config_from_args
+from jev_bot.cli import build_parser, make_live_jev
+from jev_bot.live import LiveConfig, LiveSession, describe_model, live_config_from_args
+from jev_bot.surrogate import JevSurrogate
 from jev_bot.mt5_broker import MT5Broker, resolve_symbol
 from jev_bot.mt5_feed import (
     DEGRADED_WITHOUT_DEPTH,
@@ -60,7 +61,7 @@ from jev_bot.risk import (
     trade_mode_name,
 )
 from jev_bot.state import StateBuilder
-from jev_bot.typesafe import Answer, JevError, Response
+from jev_bot.typesafe import Answer, JevClient, JevError, Response
 
 UTC = timezone.utc
 _SECRET_KEYS = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_PATH", "MT5_CONFIRM_REAL", "TYPESAFE_API_KEY")
@@ -707,6 +708,19 @@ class Adapter(_CleanEnv):
         self.assertTrue(jev_bot.cli.cmd_live)
         self.assertTrue(resolve_symbol)
 
+    def test_history_lookback_stays_on_the_unix_epoch(self):
+        # Windows raises OSError for timestamps before 1970. A short injected
+        # clock plus the 800s lookback used to call fromtimestamp(-750).
+        fake = FakeMT5()
+        broker = MT5Broker(mt5=fake)
+        broker.connect()
+        self.assertEqual(broker.history_ticks(800, now_unix=50.0), [])
+        start, end = fake.range_window
+        # 50 - 800 is before 1970. Windows refuses that timestamp, so the
+        # request is clamped to the epoch instead of raising.
+        self.assertGreaterEqual(start.timestamp(), 0)
+        self.assertGreaterEqual(end.timestamp(), 0)
+
 
 class Session(_CleanEnv):
     def _now(self):
@@ -925,13 +939,33 @@ class Session(_CleanEnv):
         self.assertLess(abs(session.buffer.rows[-1].t - unix), 30)
 
     def test_jev_error_connection_loss_and_interrupt_flatten(self):
+        # An API failure holds. It does not flatten and it does not leave the loop.
         fake = FakeMT5()
         fake.positions = [_position()]
         session = _ready(fake, _cfg(dry_run=False), BoomJev())
         t = _prefill(session)
-        with redirect_stdout(io.StringIO()), self.assertRaises(JevError):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
             session.on_bar(_bar(t), self._now())
-        self.assertEqual(fake.orders[0]["type"], 1)
+        self.assertEqual(fake.orders, [])
+        self.assertEqual(len(fake.positions), 1)
+        self.assertIn("holding", buf.getvalue())
+        # The state sent to Jev marks the level-1 book. BoomJev raises before we can read it,
+        # so a recording stand-in checks the next bar.
+        seen = []
+
+        class RecordingJev:
+            model = "jev-latest"
+            def system_one(self, state, questions):
+                seen.append(state)
+                return _response()
+
+        session.jev = RecordingJev()
+        with redirect_stdout(io.StringIO()):
+            session.on_bar(_bar(t + 1), self._now())
+        self.assertEqual(seen[0]["data_quality"]["market_depth"], "unavailable")
+        self.assertEqual(seen[0]["data_quality"]["book_signals"], "degraded")
+        self.assertIn("best_level", seen[0]["data_quality"]["note"])
 
         fake = FakeMT5()
         fake.positions = [_position()]
@@ -998,6 +1032,119 @@ class Session(_CleanEnv):
 
 
 class Cli(_CleanEnv):
+    def test_live_uses_jev_only_when_the_key_is_set(self):
+        missing = build_parser().parse_args(["--model", "jev-latest", "live", "--broker", "mt5"])
+        jev = make_live_jev(missing)
+        self.assertIsInstance(jev, JevSurrogate)
+        self.assertIn("offline stand-in", describe_model(jev))
+        fake = FakeMT5()
+        session = _session(fake, _cfg(), jev)
+        session.broker.connect()
+        session.ensure_allowed()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session._announce()
+        text = buf.getvalue()
+        self.assertIn("surrogate-local (offline stand-in, not Jev)", text)
+        self.assertIn("TYPESAFE_API_KEY is not set", text)
+
+        token = "unit-test-key"
+        os.environ["TYPESAFE_API_KEY"] = token
+        present = build_parser().parse_args(["live", "--broker", "mt5"])
+        jev = make_live_jev(present)
+        self.assertIsInstance(jev, JevClient)
+        self.assertEqual(jev.model, "jev-latest")
+        self.assertIn("TypeSafe Jev", describe_model(jev))
+        session = _session(fake, _cfg(), jev)
+        session.broker.connect()
+        session.ensure_allowed()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session._announce()
+        text = buf.getvalue()
+        self.assertIn("jev-latest (TypeSafe Jev)", text)
+        self.assertNotIn("WARNING", text)
+        self.assertNotIn(token, text)
+        self.assertNotIn(token, repr(describe_model(jev)))
+
+    def test_mocked_jev_api_holds_on_failure_and_hides_the_key(self):
+        import json
+        import urllib.error
+        token = "unit-test-key"
+        os.environ["TYPESAFE_API_KEY"] = token
+        jev = JevClient(model="jev-latest", base_url="http://jev.invalid", timeout=1, max_retries=1)
+        captured = {}
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+            def read(self):
+                return self._payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+
+        calls = {"n": 0}
+
+        def open_url(req, timeout=0):
+            calls["n"] += 1
+            self.assertEqual(timeout, 1)
+            self.assertEqual(req.get_header("Authorization"), f"Bearer {token}")
+            body = json.loads(req.data.decode())
+            captured["body"] = body
+            if calls["n"] == 1:
+                from http.client import HTTPMessage
+                headers = HTTPMessage()
+                headers["retry-after"] = "0"
+                raise urllib.error.HTTPError(req.full_url, 429, "rate", headers, io.BytesIO(b"slow"))
+            answers = {}
+            for key, question in body["questions"].items():
+                if question["type"] == "noul":
+                    answers[key] = {"type": "noul", "noul": 0.1}
+                elif question["type"] == "choice":
+                    opts = list(question["criteria"])
+                    choice = "hold" if "hold" in opts else opts[0]
+                    answers[key] = {
+                        "type": "choice", "choice": choice, "confidence": 0.2,
+                        "probabilities": {opt: (1.0 if opt == choice else 0.0) for opt in opts},
+                    }
+                else:
+                    answers[key] = {"type": "score", "score": 0.4, "confidence": 0.2, "probabilities": {"0": 1.0}}
+            payload = json.dumps({
+                "model": "jev-1.13.0", "answers": answers,
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            }).encode()
+            return _Resp(payload)
+
+        fake = FakeMT5()
+        session = _ready(fake, _cfg(), jev)
+        t = _prefill(session)
+        now = datetime(2026, 10, 26, 16, tzinfo=UTC)
+        buf = io.StringIO()
+        with patch("urllib.request.urlopen", side_effect=open_url), redirect_stdout(buf):
+            session.on_bar(_bar(t), now)
+        text = buf.getvalue()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(captured["body"]["model"], "jev-latest")
+        self.assertEqual(captured["body"]["state"]["data_quality"]["book_signals"], "degraded")
+        self.assertIn("first answer · model jev-1.13.0", text)
+        self.assertNotIn(token, text)
+        self.assertEqual(fake.orders, [])
+
+        def explode(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 503, "down", None, io.BytesIO(f"rejected {token}".encode()))
+
+        jev.max_retries = 0
+        buf = io.StringIO()
+        with patch("urllib.request.urlopen", side_effect=explode), redirect_stdout(buf):
+            session.on_bar(_bar(t + 1), now)
+        text = buf.getvalue()
+        self.assertIn("holding", text)
+        self.assertNotIn(token, text)
+        self.assertIn("***", text)
+        self.assertEqual(fake.orders, [])
+
     def test_live_dry_run_is_the_default_and_documented(self):
         args = build_parser().parse_args(["live", "--broker", "mt5", "--dry-run"])
         cfg = live_config_from_args(args)

@@ -47,7 +47,9 @@ def decision_questions() -> dict[str, Question]:
             criteria={"true": "Price is clearly away from where the flow says it should be",
                       "false": "Price is in line with the flow"}),
         "book_pressure": Choice(
-            instructions="Which way does `order_book` lean, using `best_level`, `top_five_levels` and `micro_price`?",
+            instructions="Which way does `order_book` lean, using `best_level`, `top_five_levels` and `micro_price`? "
+                         "If `data_quality.book_signals` is degraded, those three fields are placeholders from a "
+                         "level-1 book and do not show a real queue.",
             criteria={"up": "The book favours the price ticking up", "down": "The book favours the price ticking down",
                       "neutral": "The book is balanced"}),
         # --- reading the forming candle

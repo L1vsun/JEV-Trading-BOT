@@ -38,6 +38,20 @@ def make_jev(args) -> object:
     return JevClient(model=name, cache=cache, cache_only=bool(args.replay_cache))
 
 
+def make_live_jev(args) -> object:
+    """The real Jev model when ``TYPESAFE_API_KEY`` is set, otherwise the surrogate.
+
+    The key is read from the environment and is not copied into the returned
+    object beyond what ``JevClient`` already keeps for the Authorization
+    header. This function never puts the key in an exception or a log line.
+    A missing key does not raise: live trading falls back to the surrogate.
+    """
+    requested = getattr(args, "model", None)
+    if requested == "surrogate" or not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+        return JevSurrogate()
+    return make_jev(args)
+
+
 def report(res, out_dir: Path) -> str:
     m = res.metrics
     f = lambda v, d=2: "n/a" if v is None else f"{v:.{d}f}"
@@ -160,7 +174,7 @@ def cmd_live(args) -> None:
     try:
         cfg = live_config_from_args(args)
         broker = MT5Broker(symbol=cfg.symbol, magic=cfg.magic, deviation=cfg.limits.deviation_points)
-        LiveSession(broker, make_jev(args), cfg).run()
+        LiveSession(broker, make_live_jev(args), cfg).run()
     except KeyboardInterrupt:
         print("stopped", flush=True)
     except TradingHalted as e:

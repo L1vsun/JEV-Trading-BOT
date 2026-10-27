@@ -114,6 +114,16 @@ signals that go quiet without depth are in [Live trading](#live-trading-metatrad
 jev-bot live --broker mt5 --dry-run
 ```
 
+### Which model decides
+
+With `TYPESAFE_API_KEY` set, live calls the same client as `jev-bot models` and `jev-bot ask`: `POST /v1/systemone`, model `jev-latest` unless you pin one with `--model jev-1.13.0`. The startup line names it, for example `model jev-latest (TypeSafe Jev)`. The first answer also logs the version the API actually used. The key is read only from the environment. It is not written to the repo, the log, or an error message.
+
+Without the key, live keeps running on the offline surrogate and prints a warning that these are not Jev's decisions. `--model surrogate` forces that stand-in even when a key is present.
+
+The client times out, retries with backoff, and honours `retry-after` on HTTP 429 and 529. If the API is still down after those retries, that bar is a hold: nothing is sent and the process stays up. Confidence gates, the three agreeing action answers, the lot and loss limits, and the dry-run default are unchanged.
+
+RoboForex does not publish XAUUSD depth. The state Jev receives then has `data_quality.book_signals` set to `degraded`, and the book-pressure question is told that `best_level`, `top_five_levels` and `micro_price` are placeholders. Trade flow, spread, volatility, the candle and fair value are still filled from the quote and the signed tick volume.
+
 A 6-hour session at one call every 10 s is 1,980 calls. The request (state
 plus 12 questions) is about 5.2k characters, roughly 1,300 input tokens, so a
 session is ~2.6 M tokens, **about $0.11** at the published $0.042 per million.

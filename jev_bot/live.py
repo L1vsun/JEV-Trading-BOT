@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .decide import decide
+from .decide import Decision, decide
 from .features import feature_matrix
 from .mt5_feed import MarketBuffer, Tick, TickAggregator, depth_note
 from .quant import FairValueModel
@@ -35,6 +35,42 @@ from .risk import (
     require_new_york,
 )
 from .typesafe import JevError
+
+
+def describe_model(jev) -> str:
+    """Header text for the model that will actually answer. Never includes a key."""
+    name = getattr(jev, "model", "?")
+    if str(name).startswith("surrogate"):
+        return f"{name} (offline stand-in, not Jev)"
+    return f"{name} (TypeSafe Jev)"
+
+
+def mark_depth(state: dict, available: bool) -> dict:
+    """Tell Jev whether the book fields are a real depth or a level-1 placeholder.
+
+    RoboForex does not publish XAUUSD depth. The bucket strings stay defined
+    so the surrogate can still read them; ``data_quality`` says they are not
+    a queue.
+    """
+    if available:
+        state["data_quality"] = {
+            "market_depth": "available",
+            "book_signals": "from the broker depth",
+        }
+    else:
+        state["data_quality"] = {
+            "market_depth": "unavailable",
+            "book_signals": "degraded",
+            "note": (
+                "No market depth, so this is a level-1 book. "
+                "order_book.best_level, order_book.top_five_levels and order_book.micro_price "
+                "are placeholders: even queues and a centered micro-price. "
+                "Order-flow imbalance keeps only the sign of quote changes. "
+                "The aggressor tape, spread, volatility, forming candle and fair value "
+                "still come from bid, ask and signed tick volume."
+            ),
+        }
+    return state
 
 
 @dataclass
@@ -103,6 +139,7 @@ class LiveSession:
         self._contract = 0.0
         self._depth_logged = False
         self._warm_logged = False
+        self._answered = False
         self._last_tick_wall: float | None = None
 
     def ensure_allowed(self) -> None:
@@ -155,11 +192,19 @@ class LiveSession:
         spec = self.broker.spec()
         mode = "DRY-RUN" if self.cfg.dry_run else "SEND"
         self._log(
-            f"live · mt5 · {self.broker.symbol} · {mode} · model {getattr(self.jev, 'model', '?')} · "
+            f"live · mt5 · {self.broker.symbol} · {mode} · model {describe_model(self.jev)} · "
             f"contract {spec.contract_size:g} · point {spec.point:g} · lot {self.limits.lot:g} · "
             f"max_lots {self.limits.max_lots:g} · max_daily_loss {self.limits.max_daily_loss:g} · "
             f"{self.broker.describe()}"
         )
+        if str(getattr(self.jev, "model", "")).startswith("surrogate"):
+            if (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+                self._log("WARNING: live is using the offline surrogate, not TypeSafe Jev.")
+            else:
+                self._log(
+                    "WARNING: TYPESAFE_API_KEY is not set. Live decisions use the offline "
+                    "surrogate (surrogate-local), not TypeSafe Jev."
+                )
         if not self.cfg.dry_run and self.broker.trade_mode() == "real":
             self._log("REAL MONEY: orders will be sent on this account")
         self._log(self.broker.clock_text())
@@ -313,15 +358,21 @@ class LiveSession:
                 len(mkt) - 1,
                 position_text(self.position, bar.t, self.t_in, self.px_in, bar.bid, bar.ask),
             )
+            mark_depth(state, self.buffer.depth_live)
             response = self.jev.system_one(state, self.qs)
-        except JevError:
-            self.flatten("jev error")
-            raise
+        except JevError as exc:
+            # Retries and rate-limit backoff already ran inside the client.
+            # A still-failing API holds. It does not flatten and it does not stop the loop.
+            self._log(f"jev unavailable, holding: {exc}")
+            return Decision(len(self.buffer) - 1, "hold", 0.0, 0.0, {}, "jev unavailable", {})
         except (ConnectionLost, TradingHalted, KeyboardInterrupt):
             raise
         except Exception as exc:
             self.flatten("session error")
             raise TradingHalted(redact(f"{type(exc).__name__}: {exc}")) from exc
+        if not self._answered:
+            self._answered = True
+            self._log(f"first answer · model {response.model}")
         decision = decide(len(self.buffer) - 1, response, self.position)
         line = self._act(decision, bar)
         if line and (self.cfg.verbose or not line.startswith("hold")):
