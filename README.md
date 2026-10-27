@@ -220,6 +220,8 @@ These signals are degraded on that fallback. The state field Jev reads is in par
 
 These keep using bid, ask and the signed tick volume: aggressor trade imbalance, VPIN, Kyle's λ, spread, realised volatility, momentum, the forming candle, and the fair-value model. The fair-value fit still runs; its book inputs are flat while the placeholder book sits in the window, so that part of the fit is idle. History loaded from the terminal has no depth either. The first decisions wait until `--warmup` seconds are in the window (1800 by default, and at least 300, which is the momentum window in `features.py`). A quiet second still records the current bid and ask with zero volume. `copy_ticks_range` fills the warmup when the terminal has the ticks.
 
+MT5 tick times are the broker server clock, not UTC. RoboForex is often two or three hours ahead. The session measures that offset from the latest quote against the computer clock, shifts every bar to UTC, and asks the terminal for history in the broker clock. The gold session and the daily-loss window stay on real UTC (New York, and 00:00 UTC). A quiet second cannot restart the warmup.
+
 Gold spreads and commissions are wide relative to the move this bot is built to catch. They can consume the edge entirely. The table in the previous section is the simulator, with the surrogate, on a book that was built to contain the effect. It is not a live result and it is not a forecast for XAUUSD.
 
 ---

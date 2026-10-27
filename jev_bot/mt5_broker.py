@@ -9,10 +9,18 @@ and never placed in an exception message.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 
-from .mt5_feed import BookLevel, Tick, parse_book, parse_ticks
+from .mt5_feed import (
+    BookLevel,
+    Tick,
+    broker_offset_seconds,
+    parse_book,
+    parse_ticks,
+    server_unix_from_tick,
+)
 from .risk import (
     ORDER_FILLING_RETURN,
     ConnectionLost,
@@ -76,7 +84,7 @@ class OrderReport:
 
 class MT5Broker:
     def __init__(self, symbol: str = "XAUUSD", magic: int = 20261027, deviation: int = 30,
-                 mt5=None, loader=None):
+                 mt5=None, loader=None, clock=None):
         if not _SYMBOL_RE.fullmatch(symbol or ""):
             raise SymbolError("invalid symbol")
         self.requested_symbol = symbol
@@ -85,6 +93,9 @@ class MT5Broker:
         self.deviation = int(deviation)
         self._mod = mt5
         self._loader = loader or load_mt5
+        self.clock = clock or time.time
+        self.server_offset = 0
+        self.clock_locked = False
         self._book_added = False
         self._book_ok = False
         self._connected = False
@@ -204,32 +215,82 @@ class MT5Broker:
             tick_size=tick_size,
         )
 
-    def history_ticks(self, seconds: int) -> list[Tick]:
+    def ensure_clock(self, now_unix: float | None = None) -> int:
+        """Lock the broker-clock offset from the latest quote.
+
+        The offset stays 0 until a quote is within 18 hours of UTC, so a
+        Friday tick cannot be mistaken for a timezone. Later calls keep the
+        first lock: a one-second change would split the warmup.
+        """
+        if self.clock_locked:
+            return self.server_offset
+        now_unix = self.clock() if now_unix is None else now_unix
+        raw = self._mt5().symbol_info_tick(self.symbol)
+        server = server_unix_from_tick(raw) if raw is not None else None
+        if server is None:
+            return self.server_offset
+        offset = broker_offset_seconds(server, now_unix)
+        if offset is None:
+            return self.server_offset
+        self.server_offset = offset
+        self.clock_locked = True
+        return offset
+
+    def clock_text(self) -> str:
+        if not self.clock_locked:
+            return "broker clock unknown (last quote is stale)"
+        if self.server_offset == 0:
+            return "broker clock matches UTC"
+        return f"broker clock {self.server_offset:+d}s vs UTC"
+
+    def _broker_datetime(self, real_unix: float) -> datetime:
+        """Naive local datetime the terminal reads as this UTC instant on the broker clock.
+
+        ``datetime.timestamp`` of the result is ``real_unix + server_offset``.
+        That is the number stored in tick times.
+        """
+        return datetime.fromtimestamp(real_unix + self.server_offset)
+
+    def _to_utc(self, ticks: list[Tick]) -> list[Tick]:
+        delta = self.server_offset * 1000
+        if not delta:
+            return ticks
+        return [replace(t, time_msc=int(round(t.time_msc - delta))) for t in ticks]
+
+    def history_ticks(self, seconds: int, now_unix: float | None = None) -> list[Tick]:
         mt5 = self._mt5()
         fn = getattr(mt5, "copy_ticks_range", None)
         if fn is None:
             return []
-        # Naive local time: that is how the terminal reads datetimes.
-        end = datetime.now()
-        start = end - timedelta(seconds=max(1, int(seconds)))
+        now_unix = self.clock() if now_unix is None else now_unix
+        self.ensure_clock(now_unix)
+        # The terminal compares the datetime's timestamp with tick times, and
+        # those tick times use the broker clock. Ask for that clock, then
+        # shift the rows back to UTC.
+        end = self._broker_datetime(now_unix)
+        start = self._broker_datetime(now_unix - max(1, int(seconds)))
         raw = fn(self.symbol, start, end, _const(mt5, "COPY_TICKS_ALL", 3))
-        return parse_ticks(raw)
+        return self._to_utc(parse_ticks(raw))
 
-    def poll_ticks(self, since_msc: int) -> list[Tick]:
-        """Ticks newer than ``since_msc``. The first call asks for the last few seconds, not 1970."""
+    def poll_ticks(self, since_msc: int, now_unix: float | None = None) -> list[Tick]:
+        """Ticks newer than ``since_msc`` (UTC milliseconds). The first call asks for the last few seconds."""
         if not self.healthy():
             raise ConnectionLost("terminal disconnected")
         mt5 = self._mt5()
+        now_unix = self.clock() if now_unix is None else now_unix
+        self.ensure_clock(now_unix)
         if since_msc > 0:
-            start = datetime.fromtimestamp(since_msc / 1000.0)
+            start_real = since_msc / 1000.0
         else:
-            start = datetime.now() - timedelta(seconds=5)
-        raw = mt5.copy_ticks_from(self.symbol, start, 50_000, _const(mt5, "COPY_TICKS_ALL", 3))
+            start_real = now_unix - 5
+        raw = mt5.copy_ticks_from(
+            self.symbol, self._broker_datetime(start_real), 50_000, _const(mt5, "COPY_TICKS_ALL", 3),
+        )
         if raw is None:
             if not self.healthy():
                 raise ConnectionLost("terminal disconnected")
             return []
-        ticks = parse_ticks(raw)
+        ticks = self._to_utc(parse_ticks(raw))
         if since_msc:
             ticks = [t for t in ticks if t.time_msc > since_msc]
         return ticks
@@ -239,7 +300,7 @@ class MT5Broker:
         raw = mt5.symbol_info_tick(self.symbol)
         if raw is None:
             return None
-        ticks = parse_ticks([raw])
+        ticks = self._to_utc(parse_ticks([raw]))
         return ticks[0] if ticks else None
 
     def book(self) -> list[BookLevel] | None:
@@ -277,10 +338,10 @@ class MT5Broker:
     def daily_pnl(self, now: datetime | None = None) -> float:
         """Realised deals since 00:00 UTC plus floating profit, this magic only.
 
-        The terminal reads a naive datetime as the machine's local clock, so
-        the UTC midnight instant is converted before the request. Passing the
-        UTC clock numbers through unchanged would shift the day by the
-        timezone offset.
+        The terminal compares the datetime against deal times on the broker
+        clock. The UTC midnight instant is shifted by the measured offset and
+        then written as the machine's local time, which is what the package
+        reads back into a timestamp.
         """
         mt5 = self._mt5()
         now_utc = now or datetime.now(timezone.utc)
@@ -289,8 +350,11 @@ class MT5Broker:
         else:
             now_utc = now_utc.astimezone(timezone.utc)
         start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        start = _as_terminal_time(start_utc)
-        end = _as_terminal_time(now_utc)
+        self.ensure_clock(self.clock())
+        # Deal times use the broker clock too. 00:00 UTC is that instant plus
+        # the offset, not the UTC fields written through as a naive datetime.
+        start = self._broker_datetime(start_utc.timestamp())
+        end = self._broker_datetime(now_utc.timestamp())
         fn = getattr(mt5, "history_deals_get", None)
         deals = fn(start, end) if fn else None
         realised = 0.0
@@ -407,13 +471,6 @@ class MT5Broker:
                 continue
             out.append(pos)
         return out
-
-
-def _as_terminal_time(dt: datetime) -> datetime:
-    """Naive local datetime for the same instant. The terminal reads naive values as local."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().replace(tzinfo=None)
 
 
 def _enable(mt5, name: str) -> bool:

@@ -12,7 +12,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 from zoneinfo import ZoneInfoNotFoundError
 from dataclasses import fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,7 +32,9 @@ from jev_bot.mt5_feed import (
     aggressor,
     book_sizes,
     depth_note,
+    broker_offset_seconds,
     parse_ticks,
+    server_unix_from_tick,
 )
 from jev_bot.risk import (
     CONFIRM_PHRASE,
@@ -150,6 +152,8 @@ class FakeMT5:
         self.quote = {"bid": 2000.0, "ask": 2000.2, "last": 0.0, "volume": 1.0, "volume_real": 0.0, "flags": 0, "time_msc": 1_700_000_000_000}
         self.batches: list = []
         self.tick_from = None
+        self.range_window = None
+        self.time_filter = False
         self.history = []
         self.book_levels = None
         self.positions: list = []
@@ -201,16 +205,29 @@ class FakeMT5:
         q = self.quote
         return SimpleNamespace(time=q["time_msc"] // 1000, time_msc=q["time_msc"], **{k: q[k] for k in ("bid", "ask", "last", "volume", "volume_real", "flags")})
 
+    def _unix(self, value) -> float:
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return float(value)
+
     def copy_ticks_from(self, symbol, date_from, count, flags):
         self.tick_from = date_from
         if self.raise_keyboard:
             raise KeyboardInterrupt
+        if self.time_filter:
+            start = self._unix(date_from)
+            rows = [row for row in self.history if row["time_msc"] / 1000.0 >= start - 0.001]
+            return rows[:count]
         if not self.batches:
             return []
         return self.batches.pop(0)
 
     def copy_ticks_range(self, symbol, start, end, flags):
-        return self.history
+        self.range_window = (start, end)
+        if not self.time_filter:
+            return self.history
+        s, e = self._unix(start), self._unix(end)
+        return [row for row in self.history if s <= row["time_msc"] / 1000.0 <= e + 0.001]
 
     def market_book_add(self, symbol):
         return self.book_levels is not None
@@ -503,6 +520,18 @@ class Hours(_CleanEnv):
         self.assertTrue(gold_session_open(at(2026, 1, 5, 22, 30)))
         self.assertTrue(MarketHours("always").is_open(at(2026, 10, 24, 15)))
 
+    def test_broker_offset_is_server_minus_utc_and_ignores_a_stale_quote(self):
+        real = datetime(2026, 10, 27, 22, 24, 42, tzinfo=UTC)
+        server_wall = datetime(2026, 10, 28, 0, 24, 39)  # naive, as symbol_info_tick().time
+        server_unix = server_unix_from_tick({"time": server_wall, "time_msc": 0})
+        self.assertEqual(server_unix, datetime(2026, 10, 28, 0, 24, 39, tzinfo=UTC).timestamp())
+        self.assertEqual(broker_offset_seconds(server_unix, real.timestamp()), 7197)
+        msc = int(round((real.timestamp() + 7200) * 1000))
+        self.assertEqual(broker_offset_seconds(msc / 1000.0, real.timestamp()), 7200)
+        self.assertIsNone(broker_offset_seconds(real.timestamp() - 3 * 86400, real.timestamp()))
+        parsed = parse_ticks([{"time": server_wall, "time_msc": 0, "bid": 2000.0, "ask": 2000.2}])
+        self.assertEqual(parsed[0].time_msc, int(round(server_unix * 1000)))
+
     def test_missing_time_zone_stops_the_session(self):
         when = datetime(2026, 10, 26, 16, tzinfo=UTC)
         with patch("jev_bot.risk.ZoneInfo", side_effect=ZoneInfoNotFoundError("America/New_York")):
@@ -640,6 +669,16 @@ class Adapter(_CleanEnv):
         start, end = fake.deal_window
         self.assertEqual(start, datetime(2026, 10, 26, tzinfo=UTC).astimezone().replace(tzinfo=None))
         self.assertEqual(end, when.astimezone().replace(tzinfo=None))
+        # A live quote two hours ahead of UTC moves the deal query onto the broker clock.
+        ahead = datetime(2026, 10, 27, 22, 24, 42, tzinfo=UTC)
+        fake.quote["time_msc"] = int(round((ahead.timestamp() + 7200) * 1000))
+        broker.clock = lambda: ahead.timestamp()
+        broker.clock_locked = False
+        broker.daily_pnl(ahead)
+        start, end = fake.deal_window
+        self.assertAlmostEqual(start.timestamp(), datetime(2026, 10, 27, tzinfo=UTC).timestamp() + 7200, delta=1)
+        self.assertAlmostEqual(end.timestamp(), ahead.timestamp() + 7200, delta=1)
+        self.assertEqual(broker.server_offset, 7200)
         fake.positions = [_position(ticket=7), _position(ticket=8, magic=999, volume=1.0)]
         fake.orders.clear()
         broker.close_all()
@@ -822,6 +861,68 @@ class Session(_CleanEnv):
         quote = broker.quote()
         self.assertAlmostEqual(quote.bid, 2000.0)
         self.assertAlmostEqual(quote.ask, 2000.2)
+
+    def test_server_clock_offset_keeps_warmup_and_decides(self):
+        # The observed RoboForex quote: broker wall 00:24, PC UTC 22:24.
+        frozen = datetime(2026, 10, 27, 22, 24, 42, tzinfo=UTC)
+        unix = frozen.timestamp()
+        offset = 7200
+        fake = FakeMT5()
+        fake.time_filter = True
+        rows = []
+        for i in range(420):
+            server = unix + offset - 399 + i
+            rows.append({
+                "time": int(server), "time_msc": int(round(server * 1000)),
+                "bid": 2000 + (i % 7) * 0.01, "ask": 2000.2 + (i % 7) * 0.01,
+                "last": 0.0, "volume": 1.0, "volume_real": 0.0, "flags": 32,
+            })
+        fake.history = rows
+        fake.quote["time_msc"] = int(round((unix + offset) * 1000))
+        cfg = _cfg(warmup=320, step=1, history=800, hours="gold")
+        session = _session(
+            fake, cfg, ScriptedJev([_response()]),
+            now=lambda: frozen, clock=lambda: unix,
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            session.run(max_steps=2)
+        text = buf.getvalue()
+        self.assertIn("broker clock +7200s vs UTC", text)
+        self.assertNotIn("feed gap", text)
+        self.assertIn("DRY-RUN BUY", text)
+        self.assertGreaterEqual(len(session.buffer), 320)
+        self.assertLess(abs(session.buffer.rows[-1].t - unix), 30)
+        self.assertAlmostEqual(fake.range_window[1].timestamp(), unix + offset, delta=1)
+
+    def test_gold_session_uses_utc_not_the_broker_clock(self):
+        # Sunday 20:00 UTC is before the New York open. The same instant on a
+        # clock two hours ahead is already inside the session.
+        closed = datetime(2026, 10, 25, 20, 0, tzinfo=UTC)
+        self.assertFalse(gold_session_open(closed))
+        self.assertTrue(gold_session_open(closed + timedelta(hours=2)))
+        unix = closed.timestamp()
+        offset = 7200
+        fake = FakeMT5()
+        fake.time_filter = True
+        fake.history = [{
+            "time": int(unix + offset - 399 + i),
+            "time_msc": int(round((unix + offset - 399 + i) * 1000)),
+            "bid": 2000 + (i % 5) * 0.01, "ask": 2000.2 + (i % 5) * 0.01,
+            "last": 0.0, "volume": 1.0, "volume_real": 0.0, "flags": 32,
+        } for i in range(400)]
+        fake.quote["time_msc"] = int(round((unix + offset) * 1000))
+        cfg = _cfg(warmup=320, step=1, history=800, hours="gold", dry_run=False)
+        session = _session(
+            fake, cfg, ScriptedJev([_response()]),
+            now=lambda: closed, clock=lambda: unix,
+        )
+        with redirect_stdout(io.StringIO()):
+            session.run(max_steps=2)
+        self.assertEqual(fake.orders, [])
+        self.assertEqual(session.position, 0)
+        self.assertGreaterEqual(len(session.buffer), 320)
+        self.assertLess(abs(session.buffer.rows[-1].t - unix), 30)
 
     def test_jev_error_connection_loss_and_interrupt_flatten(self):
         fake = FakeMT5()

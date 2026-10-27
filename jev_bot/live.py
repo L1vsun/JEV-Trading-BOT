@@ -133,6 +133,7 @@ class LiveSession:
             if not getattr(self.broker, "connected", False):
                 self.broker.connect()
             self.ensure_allowed()
+            self.broker.ensure_clock(self.clock())
             self._announce()
             self._backfill()
             steps = 0
@@ -161,9 +162,10 @@ class LiveSession:
         )
         if not self.cfg.dry_run and self.broker.trade_mode() == "real":
             self._log("REAL MONEY: orders will be sent on this account")
+        self._log(self.broker.clock_text())
 
     def _backfill(self) -> None:
-        ticks = self.broker.history_ticks(self.cfg.history)
+        ticks = self.broker.history_ticks(self.cfg.history, now_unix=self.clock())
         bars = self.agg.bars(ticks, None) if ticks else []
         for bar in bars:
             self.buffer.append(bar)
@@ -179,7 +181,7 @@ class LiveSession:
         if not self.broker.healthy():
             raise ConnectionLost("terminal disconnected")
         now = self.now()
-        ticks = self.broker.poll_ticks(self.last_msc)
+        ticks = self.broker.poll_ticks(self.last_msc, now_unix=self.clock())
         book = self.broker.book()
         if not self._depth_logged:
             self._depth_logged = True
@@ -199,13 +201,26 @@ class LiveSession:
             self.on_bar(bar, now)
 
     def _quiet_bars(self, book, now: datetime):
-        """One second of the current quote when no new tick arrived. Volume stays zero."""
+        """One second of the current quote when no new tick arrived. Volume stays zero.
+
+        The stamp is UTC. A synthetic second never clears the warmup: a quote
+        that is still on the broker clock, or a poll that lands far from the
+        last bar, is skipped instead of looking like a weekend gap.
+        """
         q = self.broker.quote()
         if q is None or q.bid <= 0 or q.ask <= 0:
             raise ConnectionLost("symbol info unavailable")
-        stamp = int(now.timestamp() * 1000)
-        if self.buffer.rows and stamp // 1000 <= self.buffer.rows[-1].t:
-            stamp = (self.buffer.rows[-1].t + 1) * 1000
+        wall = int(now.timestamp() * 1000)
+        stamp = wall
+        if q.time_msc and abs(q.time_msc - wall) <= self.cfg.max_gap * 1000:
+            stamp = q.time_msc
+        if self.buffer.rows:
+            last = self.buffer.rows[-1].t
+            sec = stamp // 1000
+            if sec <= last:
+                stamp = (last + 1) * 1000
+            elif sec > last + self.cfg.max_gap:
+                return []
         return self.agg.bars([Tick(stamp, q.bid, q.ask)], book)
 
     def _silent_for(self) -> float:

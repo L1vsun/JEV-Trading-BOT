@@ -26,6 +26,7 @@ window, so that part of the fit stays idle.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -103,6 +104,64 @@ class SecondBar:
     depth: bool
 
 
+# A broker clock more than this far from UTC is a stale quote, not a timezone.
+# Offsets in the wild stay inside ±14 hours.
+MAX_BROKER_OFFSET = 18 * 3600
+
+
+def _unix_seconds(value) -> float | None:
+    """Seconds since 1970 for a number, or for a datetime.
+
+    A naive datetime is the broker wall clock. MetaTrader stores those fields
+    as if they were UTC, so the machine's local timezone is not applied.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def server_unix_from_tick(row) -> float | None:
+    """Broker-clock Unix time of one tick, in seconds.
+
+    ``time_msc`` is milliseconds of that clock. ``time`` is the same instant
+    as seconds, or as a datetime whose wall clock is the broker time.
+    """
+    msc = _field(row, "time_msc", 0)
+    if not isinstance(msc, datetime):
+        try:
+            msc_n = float(msc or 0)
+        except (TypeError, ValueError):
+            msc_n = 0.0
+        if msc_n >= 10_000_000_000:
+            return msc_n / 1000.0
+        if msc_n >= 1_000_000_000:
+            return msc_n
+    return _unix_seconds(msc if isinstance(msc, datetime) else _field(row, "time", 0))
+
+
+def broker_offset_seconds(server_unix: float, now_unix: float) -> int | None:
+    """Seconds the broker clock is ahead of UTC, or None if the quote is stale.
+
+    MetaTrader tick times are Unix timestamps of the broker wall clock, not of
+    UTC. A quote at 00:24 broker time while UTC is 22:24 is +7200. A quote
+    left over from a previous session is days away and is not a timezone.
+    """
+    delta = float(server_unix) - float(now_unix)
+    if abs(delta) > MAX_BROKER_OFFSET:
+        return None
+    return int(round(delta))
+
+
 def _field(row, name: str, default=0):
     if isinstance(row, dict):
         return row.get(name, default)
@@ -123,9 +182,18 @@ def parse_ticks(raw) -> list[Tick]:
         return []
     out: list[Tick] = []
     for row in raw:
-        msc = int(_field(row, "time_msc", 0) or 0)
-        if not msc:
-            msc = int(_field(row, "time", 0) or 0) * 1000
+        msc_raw = _field(row, "time_msc", 0)
+        if isinstance(msc_raw, datetime):
+            sec = _unix_seconds(msc_raw)
+            msc = int(round(sec * 1000)) if sec else 0
+        else:
+            try:
+                msc = int(msc_raw or 0)
+            except (TypeError, ValueError):
+                msc = 0
+        if msc <= 0:
+            sec = _unix_seconds(_field(row, "time", 0))
+            msc = int(round(sec * 1000)) if sec else 0
         out.append(Tick(
             time_msc=msc,
             bid=float(_field(row, "bid", 0) or 0),

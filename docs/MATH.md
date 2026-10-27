@@ -87,7 +87,9 @@ Confidence, as TypeSafe documents it for k options, is `(k·p_max − 1)/(k − 
 ## Live MT5 book
 
 `jev-bot live` builds the same one-second `Market` the formulas above already
-expect. Bid and ask are the last quote in each second. Trade volume is the
+expect. Bid and ask are the last quote in each second. Bar times are UTC:
+MetaTrader stamps ticks with the broker server clock, and the session
+subtracts the offset measured from the latest quote. Trade volume is the
 tick volume, signed by the MT5 tick flags (buy/sell), then by the last price
 against the quote, then by the tick rule. When `market_book_get` returns both
 sides, those sizes fill `bid_sz` / `ask_sz`. With no depth the second is a
