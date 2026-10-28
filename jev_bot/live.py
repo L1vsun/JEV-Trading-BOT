@@ -581,11 +581,17 @@ class LiveSession:
         self._log(f"jev smoke ok · {n} model(s) reachable")
 
     def _announce(self) -> None:
+        from .risk import filling_name, select_filling
         spec = self.broker.spec()
+        fill = select_filling(spec.filling_mode, spec.trade_exemode)
         avoid = "off" if self.cfg.avoid is None else f"{self.cfg.avoid.text} Europe/Berlin"
         self._log(
             f"live · mt5 · {self.broker.symbol} · SEND · model {describe_model(self.jev)} · "
             f"{self.broker.describe()}"
+        )
+        self._log(
+            f"filling · mode={filling_name(fill)} · bitmask={spec.filling_mode} · "
+            f"trade_exemode={spec.trade_exemode}"
         )
         names = self.router.enabled_names()
         mtf_note = (
