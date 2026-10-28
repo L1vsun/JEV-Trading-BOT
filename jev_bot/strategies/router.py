@@ -5,7 +5,16 @@ from dataclasses import dataclass, field
 
 from ..questions import Decision, Policy
 from ..typesafe import Question, Response
-from . import consensus, orb_london, session_dir, vwap_fade
+from . import (
+    _pa_common as pa,
+    consensus,
+    orb_london,
+    pa_insidebar,
+    pa_rejection,
+    pa_structure,
+    session_dir,
+    vwap_fade,
+)
 from .common import MarketContext, Signal, to_decision
 from .minutes import closed_minutes
 
@@ -16,6 +25,9 @@ class StrategyFlags:
     vwap_fade: bool = False
     orb: bool = False
     session_dir: bool = False
+    pa_rejection: bool = False
+    pa_insidebar: bool = False
+    pa_structure: bool = False
     orb_zone: str = "Europe/London"
 
 
@@ -24,6 +36,7 @@ class StrategyRouter:
     flags: StrategyFlags = field(default_factory=StrategyFlags)
     policy: Policy = field(default_factory=Policy)
     orb_broken_days: set[str] = field(default_factory=set)
+    spent_setup_ids: set[str] = field(default_factory=set)
 
     def enabled_names(self) -> list[str]:
         names = []
@@ -35,6 +48,12 @@ class StrategyRouter:
             names.append("orb_london")
         if self.flags.session_dir:
             names.append("session_dir")
+        if self.flags.pa_rejection:
+            names.append("pa_rejection")
+        if self.flags.pa_insidebar:
+            names.append("pa_insidebar")
+        if self.flags.pa_structure:
+            names.append("pa_structure")
         return names
 
     def collect_questions(self, ctx: MarketContext) -> dict[str, Question]:
@@ -48,6 +67,21 @@ class StrategyRouter:
             ctx, zone_name=self.flags.orb_zone, broken_days=self.orb_broken_days
         ):
             qs.update(orb_london.questions())
+        pa_ready = False
+        if self.flags.pa_rejection and pa_rejection.precondition(ctx, spent=self.spent_setup_ids):
+            pin = pa_rejection.find_setup(ctx, spent=self.spent_setup_ids)
+            if pin is not None:
+                qs.update(pa_rejection.questions_for_side(pin.side))
+                qs.update(pa.liquidity_questions())
+                pa_ready = True
+        if self.flags.pa_insidebar and pa_insidebar.precondition(ctx, spent=self.spent_setup_ids):
+            setup = pa_insidebar.find_setup(ctx, spent=self.spent_setup_ids)
+            if setup is not None:
+                qs.update(pa_insidebar.questions_for_side(setup.side))
+                qs.update(pa.liquidity_questions())
+                pa_ready = True
+        if self.flags.pa_structure and pa_ready and pa_structure.precondition(ctx):
+            qs.update(pa_structure.questions())
         return qs
 
     def state_for_request(self, ctx: MarketContext, questions: dict[str, Question]) -> dict:
@@ -61,6 +95,12 @@ class StrategyRouter:
             state.update(vwap_fade.state_fields(ctx))
         if any(k.startswith("orb_") for k in questions):
             state.update(orb_london.state_fields(ctx, zone_name=self.flags.orb_zone))
+        if any(k.startswith("pa_rej_") for k in questions):
+            state.update(pa_rejection.state_fields(ctx, spent=self.spent_setup_ids))
+        if any(k.startswith("pa_ib_") for k in questions):
+            state.update(pa_insidebar.state_fields(ctx, spent=self.spent_setup_ids))
+        if any(k.startswith("pa_struct_") for k in questions):
+            state.update(pa_structure.state_fields(ctx))
         return state
 
     def decide(self, ctx: MarketContext, response: Response | None) -> Decision:
@@ -97,17 +137,53 @@ class StrategyRouter:
             else:
                 signals.append(Signal("hold", "orb_london: precondition false", "orb_london"))
 
+        if self.flags.pa_rejection:
+            if pa_rejection.precondition(ctx, spent=self.spent_setup_ids):
+                if response is None:
+                    signals.append(Signal("hold", "pa_rejection: no response", "pa_rejection"))
+                else:
+                    signals.append(pa_rejection.decide(
+                        ctx, response, self.policy, spent=self.spent_setup_ids,
+                    ))
+            else:
+                signals.append(Signal(
+                    "hold", "pa_rejection: precondition false", "pa_rejection",
+                ))
+        if self.flags.pa_insidebar:
+            if pa_insidebar.precondition(ctx, spent=self.spent_setup_ids):
+                if response is None:
+                    signals.append(Signal("hold", "pa_insidebar: no response", "pa_insidebar"))
+                else:
+                    signals.append(pa_insidebar.decide(
+                        ctx, response, self.policy, spent=self.spent_setup_ids,
+                    ))
+            else:
+                signals.append(Signal(
+                    "hold", "pa_insidebar: precondition false", "pa_insidebar",
+                ))
+
+        if self.flags.pa_structure:
+            signals = [
+                pa_structure.filter_signal(ctx, s, response, self.policy) for s in signals
+            ]
         if self.flags.session_dir:
             signals = [session_dir.filter_signal(ctx, s) for s in signals]
 
         return self._combine(ctx, signals)
 
     def note_fill(self, decision: Decision) -> None:
-        """First ORB breakout of the day is spent once a buy/sell is taken."""
+        """First ORB breakout of the day is spent once a buy/sell is taken.
+
+        Price-action setup IDs are also spent so a 1 s tick cannot re-enter.
+        """
         if decision.strategy == "orb_london" and decision.action in ("buy", "sell"):
             day = (decision.features or {}).get("day")
             if day:
                 self.orb_broken_days.add(str(day))
+        if decision.action in ("buy", "sell"):
+            setup_id = (decision.features or {}).get("setup_id")
+            if setup_id:
+                self.spent_setup_ids.add(str(setup_id))
 
     def _combine(self, ctx: MarketContext, signals: list[Signal]) -> Decision:
         if not signals:
@@ -133,17 +209,21 @@ class StrategyRouter:
             return to_decision(sells[0], ctx.bar_t)
 
         # Prefer a reason that names a blocked setup over a bare hold.
-        interesting = [s for s in signals if "blocked" in s.reason or "cost" in s.reason or "unsettled" in s.reason]
+        interesting = [
+            s for s in signals
+            if any(tok in s.reason for tok in ("blocked", "cost", "unsettled", "sl window", "spent", "veto"))
+        ]
         pick = interesting[0] if interesting else signals[0]
         return to_decision(pick, ctx.bar_t)
 
 
 def build_context(*, now, bar_t, mid, bid, ask, point, digits, position, semantic,
-                  times, mids, buy_vol, sell_vol, limits, max_hold_seconds) -> MarketContext:
+                  times, mids, buy_vol, sell_vol, limits, max_hold_seconds,
+                  avoid=None) -> MarketContext:
     minutes = closed_minutes(times, mids, buy_vol, sell_vol)
     return MarketContext(
         now=now, bar_t=bar_t, mid=mid, bid=bid, ask=ask, point=point, digits=digits,
         position=position, semantic=semantic, mids=list(mids), volumes=[b + s for b, s in zip(buy_vol, sell_vol)],
         times=list(times), buy_vol=list(buy_vol), sell_vol=list(sell_vol),
-        limits=limits, max_hold_seconds=max_hold_seconds, minutes=minutes,
+        limits=limits, max_hold_seconds=max_hold_seconds, minutes=minutes, avoid=avoid,
     )

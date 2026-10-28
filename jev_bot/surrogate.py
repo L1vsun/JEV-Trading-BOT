@@ -79,6 +79,22 @@ class JevSurrogate:
         readings["vwap_fade_short"] = _n(-2 * f["f60"] - f["c_ret"])
         readings["orb_break_up"] = _n(2 * f["tape"] + f["f60"])
         readings["orb_break_down"] = _n(-2 * f["tape"] - f["f60"])
+        # Price-action Nouls: confirm with flow; leave spent-zone / overhead vetoes as no.
+        flow_yes = _n(2 * f["f60"])
+        flow_no = _n(-2 * f["f60"])
+        clear_no = _n(-2)
+        clear_yes = _n(2)
+        for side, flow in (("long", flow_yes), ("short", flow_no if f["f60"] < 0 else _n(-2 * abs(f["f60"])))):
+            readings[f"pa_rej_r1_{side}"] = clear_yes
+            readings[f"pa_rej_r2_{side}"] = clear_yes
+            readings[f"pa_rej_r3_{side}"] = flow
+            readings[f"pa_rej_r4_{side}"] = clear_no
+            readings[f"pa_ib_i1_{side}"] = clear_yes
+            readings[f"pa_ib_i2_{side}"] = clear_yes
+            readings[f"pa_ib_i3_{side}"] = flow
+            readings[f"pa_ib_i4_{side}"] = clear_no
+        readings["pa_struct_s1"] = _n(2 * f["p5"])
+        readings["pa_struct_s2"] = _n(-2 * f["p5"])
         out: dict[str, Answer] = {}
         for qid, q in questions.items():
             if isinstance(q, Noul):

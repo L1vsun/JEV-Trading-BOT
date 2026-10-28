@@ -128,9 +128,18 @@ def live_config_from_args(args) -> LiveConfig:
         vwap_fade=bool(getattr(args, "sig_vwap_fade", False)),
         orb=bool(getattr(args, "sig_orb", False)),
         session_dir=bool(getattr(args, "filter_session_dir", False)),
+        pa_rejection=bool(getattr(args, "sig_pa_rejection", False)),
+        pa_insidebar=bool(getattr(args, "sig_pa_insidebar", False)),
+        pa_structure=bool(getattr(args, "sig_pa_structure", False)),
     )
-    if not (strategies.consensus or strategies.vwap_fade or strategies.orb):
-        raise RiskError("enable at least one of --sig-consensus, --sig-vwap-fade, --sig-orb")
+    if not (
+        strategies.consensus or strategies.vwap_fade or strategies.orb
+        or strategies.pa_rejection or strategies.pa_insidebar
+    ):
+        raise RiskError(
+            "enable at least one of --sig-consensus, --sig-vwap-fade, --sig-orb, "
+            "--sig-pa-rejection, --sig-pa-insidebar"
+        )
     return LiveConfig(
         symbol=args.symbol, step=args.step, warmup=args.warmup, history=args.history,
         levels=args.levels, dry_run=not bool(args.send), allow_real=bool(args.allow_real),
@@ -234,7 +243,10 @@ class LiveSession:
             f"consensus={'on' if flags.consensus else 'off'} · "
             f"vwap_fade={'on' if flags.vwap_fade else 'off'} · "
             f"orb={'on' if flags.orb else 'off'} · "
-            f"session_dir={'on' if flags.session_dir else 'off'}"
+            f"session_dir={'on' if flags.session_dir else 'off'} · "
+            f"pa_rejection={'on' if flags.pa_rejection else 'off'} · "
+            f"pa_insidebar={'on' if flags.pa_insidebar else 'off'} · "
+            f"pa_structure={'on' if flags.pa_structure else 'off'}"
         )
         self._log(
             f"limits · lot {self.limits.lot:g} · max_lots {self.limits.max_lots:g} · "
@@ -465,6 +477,7 @@ class LiveSession:
                 times=[int(x) for x in mkt.t], mids=[float(x) for x in raw["mid"]],
                 buy_vol=[float(x) for x in mkt.buy_vol], sell_vol=[float(x) for x in mkt.sell_vol],
                 limits=self.limits, max_hold_seconds=self.cfg.max_hold_seconds,
+                avoid=self.cfg.avoid,
             )
             questions = self.router.collect_questions(ctx)
             response = None
@@ -488,9 +501,17 @@ class LiveSession:
             self._answered = True
             self._log(f"first answer · model {response.model}")
         decision = self.router.decide(ctx, response)
-        if decision.action in ("buy", "sell") and decision.strategy:
-            feat = decision.features or {}
-            self._log(f"signal · {decision.strategy} · {decision.action} · {feat}")
+        feat = decision.features or {}
+        if decision.strategy and (
+            decision.action in ("buy", "sell")
+            or feat.get("setup_id")
+            or feat.get("nouls")
+            or feat.get("labels")
+        ):
+            self._log(
+                f"signal · {decision.strategy} · {decision.action} · "
+                f"setup={feat.get('setup_id', '-')} · {feat}"
+            )
         line = self._act(decision, bar, now)
         if line and (self.cfg.verbose or not line.startswith("hold")):
             self._log(line)

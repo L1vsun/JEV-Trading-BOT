@@ -53,6 +53,7 @@ class MarketContext:
     limits: RiskLimits
     max_hold_seconds: int
     minutes: list  # MinuteBar objects
+    avoid: object | None = None  # AvoidHours | None; optional entry-hour block
 
 
 def noul(question: str, yes: str, no: str) -> Noul:

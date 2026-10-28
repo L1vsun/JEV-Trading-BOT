@@ -236,6 +236,25 @@ jev-bot live --broker mt5 --dry-run --no-sig-consensus --sig-orb
 
 There is **no proven edge after costs** for VWAP fade, the London opening-range breakout, or the session-direction filter on XAUUSD. The research that added them found no reliable advantage once spread and slippage are counted. Run them in dry-run first, and compare against a random-entry control before sending orders. Sweep/ICT, Squeeze/NR7, EMA scalps on M1/M5 and classic Bollinger are intentionally not included.
 
+### Price-Action-Strategien
+
+Optional M5 price-action setups on the same TypeSafe pattern. Code builds M5 candles from the one-second book, ATR14, zones and the setup; Jev answers only the observable Nouls for that setup. Yes ≥ 0.7, no ≤ 0.3, mid or missing = hold. Shared building blocks live in `jev_bot/strategies/_pa_common.py`. Flags default **off** (including with `--send --allow-real`); enable them freely in dry-run.
+
+| flag | default | role |
+|---|---|---|
+| `--sig-pa-rejection` | off | pin-bar / wick rejection at a marked zone on M5 (R1–R4; R4 is a spent-zone veto) |
+| `--sig-pa-insidebar` | off | mother/inside-bar breakout only in the mother direction (I1–I4; I4 is an overhead veto) |
+| `--sig-pa-structure` | off | direction filter only: long when S1 yes and S2 no, short when S2 yes and S1 no; blocks rejection/inside-bar against the structure, never fires alone |
+
+Shared preconditions: spread ≤ 30 points, the existing spread/volatility Nouls read as no, no `--avoid-hours` block, at most one entry per setup-id, and the trigger must fire within two M5 candles after the signal candle. Stops sit beyond the signal extreme by 0.1 ATR and are taken only when that distance is 120–200 points; otherwise hold. Take-profit is `min(400, distance to the next opposing zone − 10)` points, then clamped to the global SL 200 / TP 400 / hold 900 s. A cost gate holds unless `TP ≥ max(104, 1.5×SL, 4×(spread + 6))`. Active strategies that vote long and short together still hold.
+
+```bash
+jev-bot live --broker mt5 --dry-run --no-sig-consensus --sig-pa-rejection --sig-pa-structure
+jev-bot live --broker mt5 --dry-run --sig-pa-insidebar
+```
+
+**Beleglage:** there is **no proven edge after costs** for these price-action rules on XAUUSD. Sources reviewed while scoping them (fxabsolute, ripbacktest, YuRa, Osler) do not show a reliable advantage once spread and slippage are counted. Engulfing and break-and-retest were evaluated and **not** implemented for the same reason: no evidenced edge after costs. Prefer dry-run and a random-entry control before sending orders.
+
 ### Limits
 
 | control | default | effect |
@@ -253,6 +272,9 @@ There is **no proven edge after costs** for VWAP fade, the London opening-range 
 | `--sig-vwap-fade` | off | VWAP fade (Jev only when z and the cost gate pass) |
 | `--sig-orb` | off | London opening-range breakout |
 | `--filter-session-dir` | off | keep only entries aligned with the session's first 30 minutes |
+| `--sig-pa-rejection` | off | M5 pin-bar rejection at a zone |
+| `--sig-pa-insidebar` | off | M5 inside-bar breakout in mother direction |
+| `--sig-pa-structure` | off | M5 structure filter for the PA strategies only |
 | `--hours gold` | on | XAUUSD session on the America/New_York clock, with a few minutes of buffer around the daily break. If that time zone cannot be loaded the session stops before it connects. Windows gets the database from the `tzdata` dependency. `--hours always` disables the filter. `--avoid-hours` needs Europe/Berlin the same way, and only when the option is set |
 | `jev.KILL` | `--kill-file` | creating this file closes the bot's positions and stops the process. Ctrl-C does the same |
 | a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |
@@ -298,6 +320,7 @@ jev_bot/
   mt5_feed.py    one-second bars, tick-flag aggressor, level-1 fallback
   mt5_broker.py  MetaTrader 5 terminal: symbols, quotes, depth, order_send
   risk.py        dry-run, account gate, lot/spread/loss limits, session hours, kill file
+  strategies/    optional M1/M5 strategies, TypeSafe truth tables, PA shared helpers
   cli.py         jev-bot demo | backtest | paper | live | ask | models | simulate
 tests/           the original 20 (math, causality, client, gates, end to end) plus the MT5 adapter and risk limits
 docs/MATH.md     the formulas and the papers they come from

@@ -231,6 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="enable London opening-range breakout (default off)")
     lv.add_argument("--filter-session-dir", dest="filter_session_dir", action="store_true", default=False,
                     help="keep only entries that match the first 30 minutes of the gold session (default off)")
+    lv.add_argument("--sig-pa-rejection", dest="sig_pa_rejection", action="store_true", default=False,
+                    help="enable M5 pin-bar rejection at a zone (default off)")
+    lv.add_argument("--sig-pa-insidebar", dest="sig_pa_insidebar", action="store_true", default=False,
+                    help="enable M5 inside-bar breakout in mother direction (default off)")
+    lv.add_argument("--sig-pa-structure", dest="sig_pa_structure", action="store_true", default=False,
+                    help="filter PA entries by M5 HH/HL vs LH/LL structure (default off; never fires alone)")
     lv.add_argument("-v", "--verbose", action="store_true")
     lv.set_defaults(fn=cmd_live)
     a = sp.add_parser("ask"); a.add_argument("state"); a.set_defaults(fn=cmd_ask)
