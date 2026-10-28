@@ -166,10 +166,13 @@ Higher-TF strategies set
 `k_sl` M5/M15 1.5, H1 2.0 (trend-long 2.5), H4 2.5 (2.0–3.0 band) and min-SL
 M1 200 / M5 300 / M15 500 / H1 1000 / H4 2000 points (override with
 `--min-sl-*`). TP is usually `2 × SL` (H4 Donchian has no fixed TP; trailing).
-Large H1/H4 stops are gated by the cost share and by equity plausibility
-(loss at SL for one order must not exceed current equity) — for example a
-0.02 lot on a small account can still be held. Live orders send those SL/TP
-prices on the position. `--max-hold-seconds` defaults to 900; `0` disables it.
+Large H1/H4 stops are **not** blocked by a daily-loss / Tagesbudget cap
+(there is none). They are gated only by the **cost share** and by a single-order
+**equity plausibility** check (loss at SL for that new order must not exceed
+current account equity) — for example a 0.02 lot on a small account can still
+be held. There is no sum-of-open-risk vs remaining day budget. Live orders
+send those SL/TP prices on the position. `--max-hold-seconds` defaults to 900;
+`0` disables it.
 
 `--avoid-hours` is off unless you set it. `13:00-17:00` blocks new entries from
 13:00 inclusive to 17:00 exclusive in Europe/Berlin. Positions already open are
@@ -263,9 +266,9 @@ to M1:500, M5:500, M15:400, H1:300, H4:300 (one int for every TF, or
 
 Override floors with `--min-sl-m5` / `--min-sl-m15` / `--min-sl-h1` /
 `--min-sl-h4` only if you understand the cost. The global `--sl-points 200`
-cap is **M1-only**. Large H1/H4 stops may fail the **cost gate** or
-**equity plausibility** (e.g. 0.02 lot when loss-at-SL would exceed equity).
-There is no daily-loss budget.
+cap is **M1-only**. H1/H4 entries may still fail the **cost gate** or the
+single-order **equity plausibility** check (loss-at-SL > equity → hold).
+`--max-daily-loss` and any day-budget risk sum were removed.
 
 `--hold-over-weekend` keeps bot positions across the gold-session close /
 weekend instead of flattening. `--hold-override NAME:SECONDS` lets a named
@@ -286,7 +289,7 @@ structure break or PB4 yes). M1–M15 trade both ways; H1/H4 shorts need
 Classic EMA/impulse pullbacks are often **negative after costs** on M5–H1 for
 XAUUSD-style spreads (same fxabsolute / cost-per-R picture). The H4 EMA50
 variant is **untested** here — treat it as an experiment gated by cost share
-and equity plausibility, not by a daily-loss cap.
+and equity plausibility only (no daily-loss / Tagesbudget stop).
 
 There is also **no proven edge after costs** for VWAP fade, London ORB,
 session-dir, or the price-action rules on XAUUSD.
@@ -317,6 +320,7 @@ magic is flat.
 | `--max-lots` | `0.05` | hard cap on **sum** of open bot lots + new order |
 | `--max-positions` | `5` | across all bot magics (also max 1 per strategy/magic) |
 | `--no-hedge` | off | block opening a side opposite any open bot position |
+| *(no `--max-daily-loss`)* | — | removed; only single-order equity plausibility remains |
 | `--max-spread` | `30` | skip a new entry when the spread is wider, in points |
 | `--sl-points` | `200` | global M1 stop; `0` leaves it unset |
 | `--tp-points` | `400` | global take-profit; `0` leaves it unset |
