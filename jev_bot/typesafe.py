@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -145,6 +146,7 @@ class ResponseCache:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.mem: dict[str, dict] = {}
+        self._lock = threading.Lock()
         if self.path.exists():
             for line in self.path.read_text().splitlines():
                 if line.strip():
@@ -156,14 +158,16 @@ class ResponseCache:
         return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def get(self, body: dict) -> dict | None:
-        return self.mem.get(self.key(body))
+        with self._lock:
+            return self.mem.get(self.key(body))
 
     def put(self, body: dict, response: dict) -> None:
         k = self.key(body)
-        self.mem[k] = response
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a") as f:
-            f.write(json.dumps({"key": k, "response": response}) + "\n")
+        with self._lock:
+            self.mem[k] = response
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a") as f:
+                f.write(json.dumps({"key": k, "response": response}) + "\n")
 
 
 # ---------------------------------------------------------------- client
@@ -192,6 +196,8 @@ class JevClient:
         self.cache_only = cache_only
         self.usage = Usage()
         self.last_payload: dict | None = None
+        # HTTP may run concurrently; bookkeeping under this lock.
+        self._lock = threading.Lock()
         if not self.api_key and not cache_only:
             raise JevError(
                 "TYPESAFE_API_KEY is not set. Export it before calling ask, models, or live "
@@ -227,23 +233,25 @@ class JevClient:
     def system_one(self, state: Any, questions: dict[str, Question]) -> Response:
         body = {"state": state, "model": self.model, "questions": {k: q.to_json() for k, q in questions.items()}}
         # The body is the request. The key stays on the Authorization header only.
-        self.last_payload = body
         t0 = time.perf_counter()
         raw = self.cache.get(body) if self.cache else None
         cached = raw is not None
         if raw is None:
             if self.cache_only:
                 raise JevError("request not in cache (cache_only mode)")
+            # Concurrent callers may hit the network in parallel.
             raw = self._request("POST", "/v1/systemone", body)
             if self.cache:
                 self.cache.put(body, raw)
         ms = (time.perf_counter() - t0) * 1000
         u = raw.get("usage") or {}
-        self.usage.calls += 1
-        if not cached:
-            self.usage.input_tokens += int(u.get("input_tokens", 0))
-            self.usage.output_tokens += int(u.get("output_tokens", 0))
-            self.usage.latency_ms.append(ms)
+        with self._lock:
+            self.last_payload = body
+            self.usage.calls += 1
+            if not cached:
+                self.usage.input_tokens += int(u.get("input_tokens", 0))
+                self.usage.output_tokens += int(u.get("output_tokens", 0))
+                self.usage.latency_ms.append(ms)
         return Response(raw.get("model", self.model), {k: Answer.from_json(v) for k, v in raw["answers"].items()},
                         int(u.get("input_tokens", 0)), int(u.get("output_tokens", 0)), ms, cached)
 

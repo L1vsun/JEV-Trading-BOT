@@ -205,7 +205,17 @@ def build_parser() -> argparse.ArgumentParser:
             f"{CONFIRM_PHRASE}"
         ),
     )
-    lv.add_argument("--step", type=int, default=10, help="seconds between decisions")
+    lv.add_argument(
+        "--step", type=int, default=10,
+        help="seconds between decision ticks (1 or more; use 3 with --jev-interval 3)",
+    )
+    lv.add_argument(
+        "--jev-interval", type=float, default=0.0, metavar="SECONDS",
+        help=(
+            "fresh Jev ask at most every SECONDS per ready strategy "
+            "(concurrent; 0 = candle-close cache, the default)"
+        ),
+    )
     lv.add_argument(
         "--warmup", type=int, default=1800,
         help="seconds of book required before the first decision (at least 300)",

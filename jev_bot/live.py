@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
@@ -219,6 +220,9 @@ class LiveConfig:
     h1_use_sma50_200: bool = False
     hold_over_weekend: bool = False
     hold_overrides: dict[str, int] = field(default_factory=dict)
+    # 0 = candle-close cache (default). >0 = fresh Jev ask at most every N seconds
+    # per strategy whose code precondition is met (no candle cache).
+    jev_interval: float = 0.0
 
 
 def parse_magic_offset_json(text: str | None) -> dict[str, int]:
@@ -263,6 +267,9 @@ def live_config_from_args(args) -> LiveConfig:
         raise RiskError("history must cover the warmup")
     if args.hours not in ("gold", "always"):
         raise RiskError("market hours must be 'gold' or 'always'")
+    jev_interval = float(getattr(args, "jev_interval", 0) or 0)
+    if jev_interval < 0:
+        raise RiskError("--jev-interval must be >= 0 (0 keeps the candle-close cache)")
     if not bool(getattr(args, "allow_real", False)):
         raise RiskError(
             "live always sends orders; pass --allow-real and set MT5_CONFIRM_REAL "
@@ -349,6 +356,7 @@ def live_config_from_args(args) -> LiveConfig:
         h1_use_sma50_200=bool(getattr(args, "h1_sma50_200", False)),
         hold_over_weekend=bool(getattr(args, "hold_over_weekend", False)),
         hold_overrides=dict(hold_overrides),
+        jev_interval=jev_interval,
     )
 
 
@@ -399,7 +407,11 @@ class LiveSession:
         self._lot_equity: float | None = None
         self.entry_window = EntryWindow()
         # Jev candle-close cache: (strategy, candle_open_t) → Response (answer subset).
+        # Used only when ``jev_interval == 0``.
         self._jev_cache: dict[tuple[str, int], Response] = {}
+        # Interval mode: last ask time (monotonic) and last Response per strategy.
+        self._jev_last_ask_mono: dict[str, float] = {}
+        self._jev_last_response: dict[str, Response] = {}
         self._mtf_hist_warned: set[str] = set()
         self._swap_logged = False
 
@@ -589,7 +601,9 @@ class LiveSession:
             f"{_shown('tp_points', self.limits.tp_points)} · deviation {self.limits.deviation_points} · "
             f"{_shown('max_hold_seconds', self.cfg.max_hold_seconds)} · avoid_hours {avoid} · "
             f"hours {self.cfg.hours} · hold_over_weekend {hold_ow} · "
-            f"step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
+            f"step {self.cfg.step}s · jev_interval "
+            f"{'candle-close cache' if self.cfg.jev_interval <= 0 else f'{self.cfg.jev_interval:g}s'} · "
+            f"warmup {self.cfg.warmup}s · "
             f"contract {spec.contract_size:g} · point {spec.point:g} · magic_base {self.cfg.magic}"
         )
         self._log(f"strategies · {', '.join(names) if names else '(none)'}{mtf_note}")
@@ -782,6 +796,7 @@ class LiveSession:
 
         ``ask`` is ``None`` when every enabled strategy should be considered
         (no candle filter). Otherwise it is the set that needs a fresh Jev call.
+        Candle-close path only (``jev_interval == 0``).
         """
         ask: set[str] = set()
         cached: dict[str, Response] = {}
@@ -846,6 +861,111 @@ class LiveSession:
             input_tokens=tokens_in, output_tokens=tokens_out, latency_ms=latency,
             cached=fresh is None and bool(cached),
         )
+
+    def _jev_only_set(self, name: str) -> set[str]:
+        """Strategies included in one interval-mode ask for ``name``.
+
+        ``pa_structure`` is a filter and is bundled with PA entry asks.
+        """
+        only = {name}
+        if name in ("pa_rejection", "pa_insidebar") and self.router.flags.pa_structure:
+            only.add("pa_structure")
+        return only
+
+    def _jev_ask_one(self, name: str, state: dict, questions: dict) -> Response:
+        """One strategy's ``system_one`` call (safe to run in a worker thread)."""
+        return self.jev.system_one(state, questions)
+
+    def _jev_interval_ask(self, ctx, positions: dict[str, int], bar) -> Response | None:
+        """Fresh concurrent Jev asks at most every ``jev_interval`` seconds per strategy.
+
+        Skips the candle-close cache. Strategies whose code precondition is false
+        contribute no questions. Between asks, the last Response for that strategy
+        is reused for ``decide_all``. Per-strategy Jev errors hold that strategy
+        only (logged) and do not abort the whole step.
+        """
+        _ = bar  # latest closed + forming state already live in ``ctx``
+        interval = float(self.cfg.jev_interval)
+        now_m = time.monotonic()
+        due_jobs: list[tuple[str, dict, dict]] = []
+        reused: dict[str, Response] = {}
+        for name in self._enabled_entry_names():
+            if name == "pa_structure":
+                # Bundled with pa_rejection / pa_insidebar asks.
+                continue
+            only = self._jev_only_set(name)
+            questions = self.router.collect_questions(
+                ctx, positions=positions, only=only,
+            )
+            if not questions:
+                continue
+            last_t = self._jev_last_ask_mono.get(name)
+            if last_t is not None and (now_m - last_t) < interval - 1e-12:
+                prev = self._jev_last_response.get(name)
+                if prev is not None:
+                    reused[name] = prev
+                continue
+            state = self.router.state_for_request(ctx, questions, positions=positions)
+            due_jobs.append((name, questions, state))
+
+        fresh_by_name: dict[str, Response] = {}
+        if due_jobs:
+            workers = min(32, max(1, len(due_jobs)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for name, questions, state in due_jobs:
+                    self._log(
+                        f"jev ask · {name} · interval={interval:g}s · "
+                        f"questions={len(questions)}"
+                    )
+                    futures[pool.submit(self._jev_ask_one, name, state, questions)] = name
+                for fut in as_completed(futures):
+                    name = futures[fut]
+                    try:
+                        resp = fut.result()
+                    except JevError as exc:
+                        self._log(f"jev unavailable ({name}), holding: {exc}")
+                        payload = getattr(self.jev, "last_payload", None)
+                        if payload is not None:
+                            self._log("jev request payload: " + payload_text(payload))
+                        continue
+                    except Exception as exc:
+                        self._log(
+                            f"jev unavailable ({name}), holding: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    self._jev_last_ask_mono[name] = time.monotonic()
+                    stored = Response(
+                        model=resp.model,
+                        answers=dict(resp.answers),
+                        input_tokens=resp.input_tokens,
+                        output_tokens=resp.output_tokens,
+                        latency_ms=resp.latency_ms,
+                        cached=False,
+                    )
+                    self._jev_last_response[name] = stored
+                    fresh_by_name[name] = stored
+
+        merged_fresh: Response | None = None
+        if fresh_by_name:
+            answers: dict[str, Answer] = {}
+            model = "?"
+            tokens_in = 0
+            tokens_out = 0
+            latency = 0.0
+            for resp in fresh_by_name.values():
+                answers.update(resp.answers)
+                model = resp.model or model
+                tokens_in += resp.input_tokens
+                tokens_out += resp.output_tokens
+                latency = max(latency, resp.latency_ms)
+            merged_fresh = Response(
+                model=model, answers=answers,
+                input_tokens=tokens_in, output_tokens=tokens_out,
+                latency_ms=latency, cached=False,
+            )
+        return self._jev_merge_response(merged_fresh, reused)
 
     def _one_poll(self) -> None:
         self._check_kill()
@@ -1075,29 +1195,40 @@ class LiveSession:
                 h1_use_sma50_200=bool(self.cfg.h1_use_sma50_200),
                 hold_overrides=dict(self.cfg.hold_overrides),
             )
-            # Jev candle-close cache: ask only when a strategy has a NEW closed
-            # signal candle. Between closes, reuse the cached Response for that
-            # strategy (SL/TP/hold/kill still run every second in _protect).
-            # Cost gates mostly run inside decide after Jev; cheap code
-            # preconditions already skip question collection when no setup.
-            ask_names, cached_by_strategy = self._jev_cache_plan(bar.t)
-            questions = self.router.collect_questions(
-                ctx, positions=positions, only=ask_names if ask_names is not None else None,
-            )
-            response = None
-            if questions:
-                for name in sorted(ask_names or ()):
-                    tf = signal_tf_for(name)
-                    candle_t = self._signal_candle_t(tf, int(bar.t))
-                    if candle_t is not None:
-                        self._log(f"jev ask · {name} · tf={tf} · candle={candle_t}")
-                sent = self.router.state_for_request(ctx, questions, positions=positions)
-                response = self.jev.system_one(sent, questions)
-                self._jev_cache_store(ask_names or set(), int(bar.t), response)
-            response = self._jev_merge_response(response, cached_by_strategy)
+            # Jev asks: default candle-close cache, or --jev-interval concurrent
+            # per-strategy refresh. Cost gates mostly run inside decide after
+            # Jev; cheap code preconditions already skip question collection.
+            step_t0 = time.monotonic()
+            if self.cfg.jev_interval > 0:
+                response = self._jev_interval_ask(ctx, positions, bar)
+            else:
+                ask_names, cached_by_strategy = self._jev_cache_plan(bar.t)
+                questions = self.router.collect_questions(
+                    ctx, positions=positions,
+                    only=ask_names if ask_names is not None else None,
+                )
+                response = None
+                if questions:
+                    for name in sorted(ask_names or ()):
+                        tf = signal_tf_for(name)
+                        candle_t = self._signal_candle_t(tf, int(bar.t))
+                        if candle_t is not None:
+                            self._log(f"jev ask · {name} · tf={tf} · candle={candle_t}")
+                    sent = self.router.state_for_request(ctx, questions, positions=positions)
+                    response = self.jev.system_one(sent, questions)
+                    self._jev_cache_store(ask_names or set(), int(bar.t), response)
+                response = self._jev_merge_response(response, cached_by_strategy)
+            if self.cfg.jev_interval > 0:
+                elapsed = time.monotonic() - step_t0
+                if elapsed > float(self.cfg.jev_interval) + 1e-12:
+                    self._log(
+                        f"warning: decision step took {elapsed:.2f}s > "
+                        f"jev-interval {self.cfg.jev_interval:g}s"
+                    )
         except JevError as exc:
             # Retries and rate-limit backoff already ran inside the client.
             # A failed call is a hold. It is not stored as a Noul of zero.
+            # (Interval mode logs per-strategy errors inside _jev_interval_ask.)
             self._log(f"jev unavailable, holding: {exc}")
             payload = getattr(self.jev, "last_payload", None)
             if payload is not None:

@@ -126,6 +126,8 @@ export MT5_CONFIRM_REAL=YES_TRADE_REAL
 jev-bot live --broker mt5 --allow-real --strategies consensus
 jev-bot live --broker mt5 --allow-real --strategies m5 --allow-short
 jev-bot live --broker mt5 --allow-real --sig-consensus --avoid-hours 13:00-17:00
+# Ask every ready strategy every 3 s (concurrent), decision tick every 3 s:
+jev-bot live --broker mt5 --allow-real --step 3 --jev-interval 3 --strategies pullback,consensus
 ```
 
 ### Lot sizing
@@ -202,9 +204,17 @@ SL/TP and hold timers are per magic; the kill file flattens every bot magic.
 Foreign magics on the account are never touched. Order comments look like
 `jev:<strategy>`; logs include `magic=` and `strategy=` on each order/exit.
 
-MTF setups evaluate **closed** signal-TF candles only. Live asks Jev when a
-ready strategy contributes questions; pass `--cache FILE` to record answers
-and reuse identical request bodies.
+MTF setups evaluate **closed** signal-TF candles only (plus forming-bar /
+tick state where a strategy already uses it). Jev ask cadence:
+
+| flag | behaviour |
+|---|---|
+| `--jev-interval 0` (default) | ask on each strategy's new closed signal candle; reuse answers until the next close |
+| `--jev-interval SECONDS` (e.g. `3`) | each ready strategy gets a **fresh** ask at most every `SECONDS` (per strategy, `time.monotonic`); candle cache off; asks run **concurrently** in a thread pool so ~22 strategies fit in one interval; Jev/rate-limit errors hold that strategy and log; a step slower than the interval logs one warning line |
+
+`--step` may be `3` (or any integer ≥ 1). Pair with `--jev-interval 3` when you
+want a decision tick and a Jev refresh every three seconds. Pass `--cache FILE`
+to record answers and reuse identical request bodies.
 
 | flag / name | role |
 |---|---|
@@ -296,11 +306,13 @@ Shared logic in `jev_bot/strategies/_pullback_common.py` (one module per TF:
 Code also requires a ±0.25 ATR EMA touch, 38–62% impulse retracement,
 continuation close beyond the pullback extreme, and ADX14≥20 or efficiency
 ratio≥0.3. SL = `max(1.2×ATR beyond extreme, min SL)`; TP = 2×SL; cost /
-spread / equity-plausibility gates as elsewhere. Jev asks only on that TF's
-candle close. Keys `pb_{tf}_pb1`…`pb5` long/short: entry when PB1–3 yes
-(≥0.7) and PB4–5 no (≤0.3); mid/missing/error → hold. Exit is code
-(SL/TP/time) plus PB4 yes. M1–M15 trade both ways; H1/H4 shorts need
-`--allow-short` (default off). Each TF has its own magic (offsets 50–54).
+spread / equity-plausibility gates as elsewhere. With default
+`--jev-interval 0`, Jev asks on that TF's candle close; with
+`--jev-interval N`, ready pullbacks refresh at most every N seconds.
+Keys `pb_{tf}_pb1`…`pb5` long/short: entry when PB1–3 yes (≥0.7) and PB4–5
+no (≤0.3); mid/missing/error → hold. Exit is code (SL/TP/time) plus PB4 yes.
+M1–M15 trade both ways; H1/H4 shorts need `--allow-short` (default off).
+Each TF has its own magic (offsets 50–54).
 
 **Beleglage:** Classic EMA/impulse pullbacks are often **negative after
 costs** on M5–H1 for XAUUSD-style spreads (fxabsolute / YuRa-style
@@ -342,6 +354,8 @@ magic is flat.
 | `--tp-points` | `400` | global take-profit; `0` leaves it unset |
 | `--min-sl-m5` / `m15` / `h1` / `h4` | 300 / 500 / 1000 / 2000 | MTF stop floors in points |
 | `--deviation` | `15` | slippage allowance in points |
+| `--step` | `10` | seconds between decision ticks (≥1; use `3` with interval mode) |
+| `--jev-interval` | `0` | `0` = candle-close cache; `>0` = fresh concurrent ask every N s per ready strategy |
 | `--max-hold-seconds` | `900` | close after this many seconds; `0` disables |
 | `--hold-override NAME:SECONDS` | off | per-strategy hold above the global cap |
 | `--hold-over-weekend` | off | keep positions across session close / weekend |
