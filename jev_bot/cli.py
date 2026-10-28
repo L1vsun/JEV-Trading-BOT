@@ -229,11 +229,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--lot-factor", type=float, default=DEFAULT_LOT_FACTOR,
         help="equity and lot multiply by this each stage",
     )
-    lv.add_argument("--max-lots", type=float, default=0.05,
-                    help="cap on sum of open bot lots plus the new order")
+    lv.add_argument(
+        "--max-lots", type=float, default=0.05,
+        help="cap on the sum of open bot lots (all magics) plus the new order",
+    )
     lv.add_argument(
         "--max-positions", type=int, default=5,
-        help="max open positions across all bot magics (1 per strategy)",
+        help="max open positions across all bot magics (also max 1 per strategy/magic)",
     )
     lv.add_argument(
         "--no-hedge", action="store_true", default=False,

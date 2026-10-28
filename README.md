@@ -184,8 +184,20 @@ or groups `m5` / `m15` / `h1` / `h4` / `pullback`) and/or `--sig-*` flags.
 H1/H4 unified pullbacks). `--h4-ema-allow-short` and `--h1-sma50-200` flip
 those strategy-specific modes.
 
-Each entry strategy uses its own MT5 magic (`--magic` base + offset). Offsets
-live in `jev_bot/strategies/magics.py` (override with `--magic-offset-json`).
+#### Multi-magic positions
+
+Each entry strategy has a fixed MT5 magic: `--magic` base (default
+`20261027`; consensus keeps offset `0`) plus the offset in
+`jev_bot/strategies/magics.py`. Override with `--magic-offset-json`. Live uses
+`decide_all`: every strategy that votes buy/sell/exit acts on **its own**
+magic. There is no "first signal wins" and no cross-strategy long/short →
+hold. Conflicting sides are allowed and logged; `--no-hedge` (default off)
+blocks opening against an existing bot side. Caps: **1 position per
+strategy/magic**, and `--max-positions` (default 5) across all bot magics.
+`--max-lots` caps the **sum** of open bot lots plus the new order. Exits,
+SL/TP and hold timers are per magic; the kill file flattens every bot magic.
+Foreign magics on the account are never touched. Order comments look like
+`jev:<strategy>`; logs include `magic=` and `strategy=` on each order/exit.
 
 MTF setups evaluate **closed** signal-TF candles only. Live asks Jev when a
 ready strategy contributes questions; pass `--cache FILE` to record answers
@@ -289,12 +301,12 @@ enabled strategy; pure code only applies gates (spread, cost, equity
 plausibility, session filters) and exits (broker SL/TP, max hold, kill,
 weekend flatten).
 
-Live uses `decide_all` (one Decision per strategy / magic). The legacy
-single-Decision `decide` / `_combine` path is order-independent: long+short
-across strategies → hold; same-direction votes use
-`STRATEGY_PRIORITY` in `router.py`. VWAP fade and London ORB each require
-**two** independent yes Nouls after the code precondition; a single yes does
-not fire. Consensus exit questions are not asked when that magic is flat.
+Live uses `decide_all` (one Decision per strategy / magic; conflicts logged).
+The legacy single-Decision `decide` helper only picks one vote by
+`STRATEGY_PRIORITY` and is not used for live fills. VWAP fade and London ORB
+each require **two** independent yes Nouls after the code precondition; a
+single yes does not fire. Consensus exit questions are not asked when that
+magic is flat.
 
 ### Limits
 
@@ -302,8 +314,9 @@ not fire. Consensus exit questions are not asked when that magic is flat.
 |---|---|---|
 | `--lot-mode` | `equity-scaled` | or `fixed` with `--lot` |
 | `--lot-base` / `--lot-start-equity` / `--lot-factor` | `0.01` / `1000` / `1.5` | equity stage table |
-| `--max-lots` | `0.05` | hard cap on order and position size |
-| `--max-positions` | `5` | across all bot magics (1 per strategy); closes still sent |
+| `--max-lots` | `0.05` | hard cap on **sum** of open bot lots + new order |
+| `--max-positions` | `5` | across all bot magics (also max 1 per strategy/magic) |
+| `--no-hedge` | off | block opening a side opposite any open bot position |
 | `--max-spread` | `30` | skip a new entry when the spread is wider, in points |
 | `--sl-points` | `200` | global M1 stop; `0` leaves it unset |
 | `--tp-points` | `400` | global take-profit; `0` leaves it unset |
@@ -331,13 +344,17 @@ symbol. Other positions on the account are left alone. Override offsets with
 | `consensus` | 0 | `m15_ny_orb` | 20 |
 | `vwap_fade` | 1 | `m15_asia_squeeze` | 21 |
 | `orb_london` | 2 | `m15_trend_pullback` | 22 |
-| `pa_rejection` | 4 | `h1_trend_long` | 30 |
-| `pa_insidebar` | 5 | `h1_pullback` | 31 |
-| `m5_ny_orb` | 10 | `h1_prevday_break` | 32 |
-| `m5_asianbox` | 11 | `h4_donchian` | 40 |
-| `m5_vwap_pb` | 12 | `h4_ema_pullback` | 41 |
-| `pullback_m1`…`m5` | 50–51 | `h4_zone_retest` | 42 |
-| `pullback_m15`…`h4` | 52–54 | | |
+| `session_dir` (filter) | 3 | `h1_trend_long` | 30 |
+| `pa_rejection` | 4 | `h1_pullback` | 31 |
+| `pa_insidebar` | 5 | `h1_prevday_break` | 32 |
+| `pa_structure` (filter) | 6 | `h4_donchian` | 40 |
+| `m5_ny_orb` | 10 | `h4_ema_pullback` | 41 |
+| `m5_asianbox` | 11 | `h4_zone_retest` | 42 |
+| `m5_vwap_pb` | 12 | `pullback_m1` | 50 |
+| | | `pullback_m5` | 51 |
+| | | `pullback_m15` | 52 |
+| | | `pullback_h1` | 53 |
+| | | `pullback_h4` | 54 |
 
 ### Depth, and the signals that go quiet
 

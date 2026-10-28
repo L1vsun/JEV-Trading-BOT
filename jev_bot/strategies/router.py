@@ -1,10 +1,10 @@
 """Collect enabled strategies; live uses one Decision per actionable vote.
 
-``decide_all`` returns every buy/sell/exit that fired (live / multi-magic).
-Long and short from different strategies are allowed and logged; ``--no-hedge``
-can block the opposing open. ``decide`` keeps a single-Decision combine:
-buy+sell across strategies → hold (order-independent); same-direction votes
-pick the earliest name in :data:`STRATEGY_PRIORITY` (not flag / token order).
+``decide_all`` (live) returns every buy/sell/exit that fired. Long and short
+from different strategies are allowed and logged; ``--no-hedge`` can block the
+opposing open. There is no "first signal wins" and no cross-strategy
+long/short → hold. ``decide`` is a legacy single-Decision helper that picks
+one exit or one entry by :data:`STRATEGY_PRIORITY` (order-independent).
 """
 from __future__ import annotations
 
@@ -466,8 +466,9 @@ class StrategyRouter:
     ) -> list[Decision]:
         """One Decision per strategy that voted buy / sell / exit.
 
-        Holds are omitted. Conflicting long and short votes are all returned;
-        live logs the conflict and applies ``--no-hedge`` if set.
+        Holds are omitted. Conflicting long and short votes are all returned
+        (no cross-strategy conflict hold); live logs them and applies
+        ``--no-hedge`` when that flag is set.
         """
         out: list[Decision] = []
         for sig in self._collect_signals(ctx, response, positions):
@@ -482,7 +483,7 @@ class StrategyRouter:
         response: Response | None,
         positions: dict[str, int] | None = None,
     ) -> Decision:
-        """Legacy OR-combine into a single Decision (conflicts become hold)."""
+        """Legacy single-Decision helper. Live uses :meth:`decide_all` instead."""
         return self._stamp(self._combine(ctx, self._collect_signals(ctx, response, positions)))
 
     def note_fill(self, decision: Decision) -> None:
@@ -507,30 +508,22 @@ class StrategyRouter:
             self.traded_days.add(str(day))
 
     def _combine(self, ctx: MarketContext, signals: list[Signal]) -> Decision:
+        """Pick one Decision by :data:`STRATEGY_PRIORITY` (legacy callers only).
+
+        Live never uses this for fills — :meth:`decide_all` keeps every vote.
+        Long and short across strategies are not collapsed into a conflict hold.
+        """
         if not signals:
             return Decision(ctx.bar_t, "hold", 0.0, 0.0, {}, "hold: no strategy enabled", {})
 
-        # Exit wins when any strategy says exit (consensus); priority picks among exits.
         exits = [s for s in signals if s.action == "exit"]
         if exits:
             return to_decision(min(exits, key=_priority_key), ctx.bar_t)
 
-        buys = [s for s in signals if s.action == "buy"]
-        sells = [s for s in signals if s.action == "sell"]
-        # Order-independent: any buy + any sell among entries → hold (conflict).
-        if buys and sells:
-            names = ", ".join(sorted({s.strategy for s in buys + sells}))
-            return Decision(
-                ctx.bar_t, "hold", 0.0, 0.0, {"conflict": True},
-                f"hold: conflict ({names})",
-                features={"buys": [s.strategy for s in buys], "sells": [s.strategy for s in sells]},
-            )
-        if buys:
-            return to_decision(min(buys, key=_priority_key), ctx.bar_t)
-        if sells:
-            return to_decision(min(sells, key=_priority_key), ctx.bar_t)
+        entries = [s for s in signals if s.action in ("buy", "sell")]
+        if entries:
+            return to_decision(min(entries, key=_priority_key), ctx.bar_t)
 
-        # Prefer a reason that names a blocked setup over a bare hold.
         interesting = [
             s for s in signals
             if any(tok in s.reason for tok in ("blocked", "cost", "unsettled", "sl window", "spent", "veto"))
