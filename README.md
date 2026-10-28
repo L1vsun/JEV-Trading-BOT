@@ -34,8 +34,8 @@ state builder                   numbers → named buckets Jev reads well
   jev_bot/state.py
         │
         ▼
-strategy router                 optional M1 / PA / M5–H4 setups OR'd together
-  jev_bot/strategies/           each enabled strategy owns its Nouls + truth table
+strategy router                 each enabled strategy votes for its own magic
+  jev_bot/strategies/           each strategy owns its Nouls + truth table
         │
         ▼
 Jev  POST /v1/systemone         typed answers, one call per decision tick
@@ -193,9 +193,9 @@ and reuse identical request bodies.
 
 | flag / name | role |
 |---|---|
-| `--sig-consensus` / `consensus` | 14-Noul consensus table |
-| `--sig-vwap-fade` / `vwap_fade` | session VWAP fade with a cost gate |
-| `--sig-orb` / `orb` | London opening-range breakout |
+| `--sig-consensus` / `consensus` | 14-Noul consensus table (exit Nouls only when that magic is open) |
+| `--sig-vwap-fade` / `vwap_fade` | session VWAP fade; **two** Jev Nouls per side must both be yes |
+| `--sig-orb` / `orb` | London ORB; **two** Jev Nouls per side must both be yes |
 | `--filter-session-dir` / `session_dir` | keep entries aligned with the gold session's first 30 minutes |
 | `--sig-pa-rejection` / `pa_rejection` | M5 pin-bar rejection at a zone |
 | `--sig-pa-insidebar` / `pa_insidebar` | M5 inside-bar breakout in mother direction |
@@ -278,6 +278,23 @@ and equity plausibility, not by a daily-loss cap.
 
 There is also **no proven edge after costs** for VWAP fade, London ORB,
 session-dir, or the price-action rules on XAUUSD.
+
+#### Decision paths (no silent offline Jev)
+
+There is no `jev_bot/surrogate.py` and no `--model surrogate` / offline
+fallback. Missing `TYPESAFE_API_KEY` or an unreachable Jev API at live start
+aborts before any order. Mid-session Jev failures hold that bar; SL/TP, hold
+time, and the kill file still run. Entries always need Jev answers for the
+enabled strategy; pure code only applies gates (spread, cost, equity
+plausibility, session filters) and exits (broker SL/TP, max hold, kill,
+weekend flatten).
+
+Live uses `decide_all` (one Decision per strategy / magic). The legacy
+single-Decision `decide` / `_combine` path is order-independent: long+short
+across strategies → hold; same-direction votes use
+`STRATEGY_PRIORITY` in `router.py`. VWAP fade and London ORB each require
+**two** independent yes Nouls after the code precondition; a single yes does
+not fire. Consensus exit questions are not asked when that magic is flat.
 
 ### Limits
 

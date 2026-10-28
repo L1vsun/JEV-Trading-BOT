@@ -1,8 +1,10 @@
 """Collect enabled strategies; live uses one Decision per actionable vote.
 
-``decide_all`` returns every buy/sell/exit that fired. Long and short from
-different strategies are allowed (logged by live). ``decide`` keeps the
-legacy OR-combine for callers that still want a single Decision.
+``decide_all`` returns every buy/sell/exit that fired (live / multi-magic).
+Long and short from different strategies are allowed and logged; ``--no-hedge``
+can block the opposing open. ``decide`` keeps a single-Decision combine:
+buy+sell across strategies → hold (order-independent); same-direction votes
+pick the earliest name in :data:`STRATEGY_PRIORITY` (not flag / token order).
 """
 from __future__ import annotations
 

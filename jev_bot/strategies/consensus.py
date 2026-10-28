@@ -1,7 +1,8 @@
 """Consensus strategy: the existing 14 Noul questions and truth table.
 
-Flag ``--sig-consensus`` (default on). Always asks its questions when enabled.
-Exit Nouls are omitted when the position is flat.
+Flag ``--sig-consensus`` (default off). Always asks its questions when enabled.
+Exit Nouls (``exit_against_long`` / ``exit_against_short``) are omitted when
+the consensus magic is flat, so a flat book does not spend API tokens on exits.
 """
 from __future__ import annotations
 

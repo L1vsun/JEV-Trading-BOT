@@ -39,27 +39,35 @@ def _require_api_key(for_cmd: str) -> None:
         )
 
 
+def _reject_surrogate(requested: str | None, *, live: bool) -> None:
+    """``--model surrogate`` and the offline Attrappe were removed (live-only)."""
+    if requested != "surrogate":
+        return
+    if live:
+        raise RiskError(
+            "live refuses --model surrogate; use a Jev model "
+            "(jev-latest or a pinned version)"
+        )
+    raise JevError(
+        "--model surrogate was removed; use a Jev model (jev-latest or a pinned version)"
+    )
+
+
 def make_jev(args) -> object:
-    """Jev client for ask/models. Requires TYPESAFE_API_KEY."""
+    """Jev client for ask/models. Requires TYPESAFE_API_KEY; no offline fallback."""
     _require_api_key("ask/models")
     requested = getattr(args, "model", None)
-    if requested == "surrogate":
-        raise JevError(
-            "--model surrogate was removed; use a Jev model (jev-latest or a pinned version)"
-        )
+    _reject_surrogate(requested, live=False)
     name = requested or "jev-latest"
     cache = ResponseCache(args.cache or args.replay_cache) if (args.cache or args.replay_cache) else None
     return JevClient(model=name, cache=cache, cache_only=bool(args.replay_cache))
 
 
 def make_live_jev(args) -> object:
-    """Real Jev only. Live refuses a missing key and the removed surrogate."""
+    """Real Jev only. Missing key aborts; no surrogate and no silent fallback."""
     _require_api_key("live")
     requested = getattr(args, "model", None)
-    if requested == "surrogate":
-        raise RiskError(
-            "live refuses --model surrogate; use a Jev model (jev-latest or a pinned version)"
-        )
+    _reject_surrogate(requested, live=True)
     name = requested or "jev-latest"
     cache = ResponseCache(args.cache) if getattr(args, "cache", None) else None
     return JevClient(model=name, cache=cache, cache_only=False)
