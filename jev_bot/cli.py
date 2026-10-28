@@ -208,7 +208,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LOT_MODE,
         help="fixed uses --lot; equity-scaled stages lot from account equity (default)",
     )
-    lv.add_argument("--lot", type=float, default=0.01, help="full-size lot in fixed mode")
+    lv.add_argument(
+        "--lot", type=float, default=0.01,
+        help="full-size lot in fixed mode; ignored when --lot-mode equity-scaled",
+    )
     lv.add_argument("--lot-base", type=float, default=DEFAULT_LOT_BASE, help="base lot for equity scaling")
     lv.add_argument(
         "--lot-start-equity", type=float, default=DEFAULT_LOT_START_EQUITY,

@@ -130,25 +130,34 @@ jev-bot live --broker mt5 --allow-real --sig-consensus --avoid-hours 13:00-17:00
 
 ### Lot sizing
 
-`--lot-mode` defaults to `equity-scaled`. Stage `n` begins at
-`start_equity * factor**n` and uses raw lot `base * factor**n`, floored to the
-broker volume step and capped by `--max-lots`. Equity below `start_equity` (or
-unreadable) stays on the base lot. The session recomputes once per UTC day and
-on entry; it does **not** change mid-position. Startup logs a short stage table
-and the current lot.
+`--lot-mode` defaults to `equity-scaled` (flags `--lot-base` 0.01,
+`--lot-start-equity` 1000, `--lot-factor` 1.5). Equity is taken from
+`account_info().equity` as MT5 reports it (no cent-account reinterpretation).
 
-| stage | equity from (default) | raw lot | typical floored lot |
+Stage `n` begins at `start_equity * factor**n` with raw lot
+`base * factor**n`, then **always floored** to the symbol `volume_step`
+(never below `volume_min`), then capped by `--max-lots`. With the usual
+0.01 step there are **no intermediate sizes** such as 0.015: stages 0 and 1
+both deliver 0.01; stage 2 delivers 0.02; stage 3 → 0.03; stage 4 → 0.05
+(then the max-lots cap). Equity below `start_equity`, or unreadable equity,
+stays on 0.01 (never a larger guess). The session recomputes once per UTC
+day and when flat before an entry; it does **not** change mid-position.
+Startup logs the stage table (through ~20 000 equity) and the current lot.
+
+| stage | equity from | raw lot | lot after 0.01 floor / max-lots 0.05 |
 |---|---|---|---|
-| 0 | 1000 | 0.01 | 0.01 |
+| 0 | &lt;1000 and from 1000 | 0.01 | 0.01 |
 | 1 | 1500 | 0.015 | 0.01 |
 | 2 | 2250 | 0.0225 | 0.02 |
 | 3 | 3375 | 0.03375 | 0.03 |
-| 4 | 5062.5 | 0.050625 | 0.05 (cap) |
+| 4 | 5062.5 | 0.050625 | 0.05 |
+| 5+ | 7593.75… | … | 0.05 (capped) |
 
-`--lot-mode fixed` uses `--lot` (default `0.01`) instead. Volume is snapped
-down to the broker step. Entries wider than `--max-spread` (points, default 30)
-are skipped. Filling mode follows the symbol. `--deviation` (default 15) is
-slippage in points. Buys pay the ask, sells hit the bid.
+`--lot-mode fixed` uses `--lot` (default `0.01`). In `equity-scaled` mode
+`--lot` is **ignored**. Volume is snapped down to the broker step. Entries
+wider than `--max-spread` (points, default 30) are skipped. Filling mode
+follows the symbol. `--deviation` (default 15) is slippage in points. Buys
+pay the ask, sells hit the bid.
 
 `--sl-points` / `--tp-points` are the global **M1 / 1-s** distances (defaults
 200 / 400). `0` leaves that side unset. They do **not** cap M5–H4 stops.

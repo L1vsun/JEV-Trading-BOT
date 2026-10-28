@@ -629,11 +629,12 @@ class LiveSession:
     def _log_lot_table(self) -> None:
         scaling = self.cfg.lot_scaling
         if scaling.mode == LOT_MODE_FIXED:
-            self._log(f"lot · mode fixed · lot {self.effective_lot():g}")
+            self._log(f"lot · mode fixed · lot {self.effective_lot():g} (--lot)")
             return
+        from .risk import equity_lot_stage
         spec = self.broker.spec()
         rows = lot_stage_table(
-            max_equity=max(20_000.0, float(scaling.start_equity) * (scaling.factor ** 6)),
+            max_equity=20_000.0,
             base=scaling.base,
             start=scaling.start_equity,
             factor=scaling.factor,
@@ -641,15 +642,21 @@ class LiveSession:
             volume_step=float(spec.volume_step),
             max_lots=float(self.limits.max_lots),
         )
-        snippet = rows[:6]
         parts = [
-            f"n={r['stage']} equity>={r['equity_from']:g} lot={r['lot']:g}"
-            for r in snippet
+            f"n={r['stage']} equity>={r['equity_from']:g} raw={r['raw_lot']:g} lot={r['lot']:g}"
+            for r in rows
         ]
         eq = "n/a" if self._lot_equity is None else f"{self._lot_equity:g}"
+        if self._lot_equity is None:
+            stage = 0
+        else:
+            stage = equity_lot_stage(
+                self._lot_equity, scaling.base, scaling.start_equity, scaling.factor,
+            )
         self._log(
-            f"lot · mode equity-scaled · equity {eq} · current {self.effective_lot():g} · "
-            f"stages: {'; '.join(parts)}"
+            f"lot · mode equity-scaled · equity {eq} · stage {stage} · "
+            f"current {self.effective_lot():g} · --lot ignored · "
+            f"table: {' · '.join(parts)}"
         )
 
     def _backfill(self) -> None:
