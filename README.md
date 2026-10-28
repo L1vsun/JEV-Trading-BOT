@@ -38,15 +38,14 @@ state builder                   numbers → named buckets Jev reads well
                                 "price is below where the order flow says it should be"
         │
         ▼
-Jev  POST /v1/systemone         12 typed questions, one call, evaluated in parallel
-  jev_bot/questions.py          regime · flow_control · informed_flow · price_lagging_flow
-  jev_bot/typesafe.py           book_pressure · candle_close · liquidity_stress · setup_quality
-                                action ×3 (self-consistency) · exit_now (speculative)
+Jev  POST /v1/systemone         14 Noul questions, one call, evaluated in parallel
+  jev_bot/questions.py          tape, trend, flow, candle, fair-value gap, spread, volatility, exit
+                                thresholds 0.7 / 0.3 and the truth table live in this file
         │
         ▼
-decision                        composite score (weights in code)
-  jev_bot/decide.py             confidence-gated sizing: full / half / none
-                                all three action answers must agree
+decision                        truth table in code
+  jev_bot/decide.py             yes ≥ 0.7, no ≤ 0.3, the band between is hold
+                                a missing answer holds; it is not a no
         │
         ▼
 execution + grading             fill 1 s later at the far side of the book, plus fees
@@ -57,16 +56,13 @@ execution + grading             fill 1 s later at the far side of the book, plus
 
 | Jev / TypeSafe feature | Where |
 |---|---|
-| **Choice** (options + probabilities + confidence) | `regime`, `flow_control`, `book_pressure`, `candle_close`, three `action` questions |
-| **Score** (probability-weighted level + confidence) | `liquidity_stress` (3 levels), `setup_quality` (5 levels) |
-| **Noul** (yes/no probability, with `true`/`false` criteria) | `informed_flow`, `price_lagging_flow`, `exit_now` |
-| **Parallel questions in one call** | all 12 per decision tick; latency barely moves with question count |
-| **Speculative fan-out** | `exit_now` is asked even when flat and only read when a position is open |
-| **Structured instructions** (object + backtick field references) | `price_lagging_flow`, `action_alt`, every question points at a named state field |
-| **Structured JSON state** | `state.py` builds nested JSON with only the fields the questions need |
-| **Confidence-gated routing** | `decide.py`: < 0.35 no trade, 0.35–0.65 half size, ≥ 0.65 full size |
-| **Composite scoring** | `decide.composite_score`: weighted sum of atomic answers, weights in code |
-| **Self-consistency** | the action is asked three ways; all three must agree |
+| **Noul** (yes/no probability, with `true`/`false` criteria) | one statement per question: tape, trend, flow, candle, fair-value gap, spread, volatility, and exit pressure |
+| **Parallel questions in one call** | all 14 per decision tick; latency barely moves with question count |
+| **Speculative fan-out** | `exit_against_long` and `exit_against_short` are asked even when flat; code reads only the open side |
+| **Named state fields** | every question points at one field with backticks |
+| **Structured JSON state** | `state.py` builds nested JSON; `state_for_model` sends only the fields the questions name |
+| **Truth table** | `questions.py`: ≥ 0.7 yes, ≤ 0.3 no, the band between is hold. Confidence is not a gate |
+| **Trace, not a gate** | `composite_trace` is the mean of the five pairs, written on the decision and not used to trade |
 | **Model aliases / pinning** | `--model jev-latest` or pin `--model jev-1.13.0`; the answering version is logged |
 | **`GET /v1/models`** | `jev-bot models` |
 | **Usage and cost** | input tokens × $0.042/Mtok tracked per run, p50 latency reported |
@@ -120,12 +116,23 @@ With `TYPESAFE_API_KEY` set, live calls the same client as `jev-bot models` and 
 
 Without the key, live keeps running on the offline surrogate and prints a warning that these are not Jev's decisions. `--model surrogate` forces that stand-in even when a key is present.
 
-The client times out, retries with backoff, and honours `retry-after` on HTTP 429 and 529. If the API is still down after those retries, that bar is a hold: nothing is sent and the process stays up. Confidence gates, the three agreeing action answers, the lot and loss limits, and the dry-run default are unchanged.
+The client times out, retries with backoff, and honours `retry-after` on HTTP 429 and 529. If the API is still down after those retries, that bar is a hold: nothing is sent and the process stays up. The failed call is not stored as a Noul of zero. The log then prints the exact request JSON (`state`, `model`, `questions`). The API key is not in that JSON. Lot and loss limits, and the dry-run default, are unchanged.
 
-RoboForex does not publish XAUUSD depth. The state Jev receives then has `data_quality.book_signals` set to `degraded`, and the book-pressure question is told that `best_level`, `top_five_levels` and `micro_price` are placeholders. Trade flow, spread, volatility, the candle and fair value are still filled from the quote and the signed tick volume.
+Jev is not asked what to do. Each question is one statement, and `questions.py` turns the answers into an order:
+
+| reading | meaning |
+|---|---|
+| `noul >= 0.7` | yes |
+| `noul <= 0.3` | no |
+| between 0.3 and 0.7 | unsettled, so the decision is hold |
+| answer missing | hold, and the reason says the answer was not read as a no |
+
+A long exits when `exit_against_long` is yes. A short exits when `exit_against_short` is yes. An unsettled exit holds. Otherwise a buy needs every buy-side Noul yes (`tape_buys_up`, `trend_up`, `flow_up`, `candle_up`, `price_below_flow`), every sell-side Noul no, and both `spread_wide` and `volatility_violent` no. A sell is the mirror. Any other mix, including a veto or an unsettled input, is hold. Size is full when the row says buy or sell.
+
+RoboForex does not publish XAUUSD depth. The request then has `data_quality.book_signals` set to `degraded`, and `best_level`, `top_five_levels` and `micro_price` are left out so a level-1 placeholder cannot be read as a queue. Spread, the aggressor tape, volatility, the candle and fair value are still filled from the quote and the signed tick volume.
 
 A 6-hour session at one call every 10 s is 1,980 calls. The request (state
-plus 12 questions) is about 5.2k characters, roughly 1,300 input tokens, so a
+plus 14 questions) is about 5.2k characters, roughly 1,300 input tokens, so a
 session is ~2.6 M tokens, **about $0.11** at the published $0.042 per million.
 Output is free. The exact count is in the report (`API usage`).
 
@@ -255,10 +262,10 @@ Gold spreads and commissions are wide relative to the move this bot is built to 
 ```
 jev_bot/
   typesafe.py    Jev client: Noul / Choice / Score, answers, retries, cost, cache, /v1/models
-  questions.py   the 12 questions
+  questions.py   the 14 Noul questions, the 0.7/0.3 cuts, and the truth table
   state.py       numbers → semantic, structured state
   surrogate.py   offline stand-in with the same typed interface
-  decide.py      composite score, confidence gates, self-consistency
+  decide.py      re-exports the truth table in questions.py
   features.py    OFI, micro-price, imbalances, VPIN, Kyle's λ, candle shape
   quant.py       walk-forward fair-value model (RLS) and candle model (online logistic)
   signals.py     divergence flags

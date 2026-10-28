@@ -69,20 +69,21 @@ contains information from after *t* (`tests/test_bot.py::Quant`).
 
 ## Decision
 
-    composite = 0.35·(P(buy) − P(sell))_avg over 3 action questions
-              + 0.20·(P(buyers) − P(sellers))
-              + 0.15·(P(book up) − P(book down))
-              + 0.10·(P(candle up) − P(candle down))
-              + 0.10·(P(trending up) − P(trending down))
-              + 0.10·P(price lagging flow)·sign
+Jev answers 14 Noul statements. The order is a truth table in `questions.py`.
+A Noul at or above 0.7 is yes, at or below 0.3 is no, and the open interval
+between them is hold. A missing answer is hold and is not treated as no.
 
-A trade needs all gates: the three action answers agree, every action
-confidence ≥ 0.35, `price_lagging_flow` ≥ 0.55, `liquidity_stress` ≤ 1.4,
-`setup_quality` ≥ 1.6, and |composite| ≥ 0.30 on the same side. The size is
-full at confidence ≥ 0.65 and half otherwise. A position is closed when
-`exit_now` ≥ 0.65 or after 15 minutes.
+Buy-side statements are `tape_buys_up`, `trend_up`, `flow_up`, `candle_up`
+and `price_below_flow`. Sell-side statements are the five mirrors. A buy
+requires every buy-side yes, every sell-side no, and both `spread_wide` and
+`volatility_violent` no. A sell is the mirror. Queue depth is not an input.
 
-Confidence, as TypeSafe documents it for k options, is `(k·p_max − 1)/(k − 1)`.
+An open long exits when `exit_against_long` is yes. An open short exits when
+`exit_against_short` is yes. An unsettled exit holds. The live session also
+closes on its own stop, target and `--max-hold-seconds` (900 by default).
+
+`composite_trace` is the mean of +1 / −1 / 0 across the five pairs. It is
+written on the decision and is not a gate. Confidence is not a gate either.
 
 ## Live MT5 book
 

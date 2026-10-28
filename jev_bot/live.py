@@ -16,7 +16,7 @@ from .decide import Decision, decide
 from .features import feature_matrix
 from .mt5_feed import MarketBuffer, Tick, TickAggregator, depth_note
 from .quant import FairValueModel
-from .questions import decision_questions
+from .questions import decision_questions, state_for_model
 from .state import StateBuilder
 from .risk import (
     AvoidHours,
@@ -38,7 +38,7 @@ from .risk import (
     require_new_york,
     stop_exit,
 )
-from .typesafe import JevError
+from .typesafe import JevError, payload_text
 
 
 def describe_model(jev) -> str:
@@ -57,28 +57,26 @@ def _shown(name: str, value: float) -> str:
 
 
 def mark_depth(state: dict, available: bool) -> dict:
-    """Tell Jev whether the book fields are a real depth or a level-1 placeholder.
+    """Record whether the terminal published a book. Queue fields are not sent.
 
-    RoboForex does not publish XAUUSD depth. The bucket strings stay defined
-    so the surrogate can still read them; ``data_quality`` says they are not
-    a queue.
+    The decision questions do not read depth. On a level-1 book the omitted
+    fields would have been placeholders, so they must not count as a signal.
     """
     if available:
         state["data_quality"] = {
             "market_depth": "available",
-            "book_signals": "from the broker depth",
+            "book_signals": "not a decision input",
+            "note": "Queue depth is not included. The questions do not read it.",
         }
     else:
         state["data_quality"] = {
             "market_depth": "unavailable",
             "book_signals": "degraded",
             "note": (
-                "No market depth, so this is a level-1 book. "
-                "order_book.best_level, order_book.top_five_levels and order_book.micro_price "
-                "are placeholders: even queues and a centered micro-price. "
-                "Order-flow imbalance keeps only the sign of quote changes. "
-                "The aggressor tape, spread, volatility, forming candle and fair value "
-                "still come from bid, ask and signed tick volume."
+                "No market depth. best_level, top_five_levels and micro_price are omitted "
+                "from the request, so a level-1 placeholder is not a queue signal. "
+                "order_book.spread is the quote. The aggressor tape, volatility, "
+                "forming candle and fair value still come from bid, ask and signed tick volume."
             ),
         }
     return state
@@ -441,11 +439,15 @@ class LiveSession:
                 position_text(self.position, bar.t, self.t_in, self.px_in, bar.bid, bar.ask),
             )
             mark_depth(state, self.buffer.depth_live)
-            response = self.jev.system_one(state, self.qs)
+            sent = state_for_model(state)
+            response = self.jev.system_one(sent, self.qs)
         except JevError as exc:
             # Retries and rate-limit backoff already ran inside the client.
-            # A still-failing API holds. It does not flatten and it does not stop the loop.
+            # A failed call is a hold. It is not stored as a Noul of zero.
             self._log(f"jev unavailable, holding: {exc}")
+            payload = getattr(self.jev, "last_payload", None)
+            if payload is not None:
+                self._log("jev request payload: " + payload_text(payload))
             return Decision(len(self.buffer) - 1, "hold", 0.0, 0.0, {}, "jev unavailable", {})
         except (ConnectionLost, TradingHalted, KeyboardInterrupt):
             raise

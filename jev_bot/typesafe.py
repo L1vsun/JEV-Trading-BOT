@@ -192,6 +192,7 @@ class JevClient:
         self.cache = cache
         self.cache_only = cache_only
         self.usage = Usage()
+        self.last_payload: dict | None = None
         if not self.api_key and not cache_only:
             raise JevError("TYPESAFE_API_KEY is not set. Use the offline surrogate (--model surrogate) "
                            "or replay a recorded run (--replay-cache FILE).")
@@ -224,6 +225,8 @@ class JevClient:
 
     def system_one(self, state: Any, questions: dict[str, Question]) -> Response:
         body = {"state": state, "model": self.model, "questions": {k: q.to_json() for k, q in questions.items()}}
+        # The body is the request. The key stays on the Authorization header only.
+        self.last_payload = body
         t0 = time.perf_counter()
         raw = self.cache.get(body) if self.cache else None
         cached = raw is not None
@@ -245,3 +248,8 @@ class JevClient:
 
     def models(self) -> list[dict]:
         return self._request("GET", "/v1/models").get("models", [])
+
+
+def payload_text(body: dict) -> str:
+    """The exact request JSON. It has no Authorization header and no API key."""
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)

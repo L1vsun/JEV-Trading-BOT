@@ -21,6 +21,7 @@ import numpy as np
 from jev_bot import features as F
 from jev_bot.cli import build_parser, make_live_jev
 from jev_bot.live import LiveConfig, LiveSession, describe_model, live_config_from_args
+from jev_bot.questions import BUY_SIDE, QUESTION_IDS, SELL_SIDE
 from jev_bot.surrogate import JevSurrogate
 from jev_bot.mt5_broker import MT5Broker, resolve_symbol
 from jev_bot.mt5_feed import (
@@ -69,19 +70,16 @@ UTC = timezone.utc
 _SECRET_KEYS = ("MT5_LOGIN", "MT5_PASSWORD", "MT5_SERVER", "MT5_PATH", "MT5_CONFIRM_REAL", "TYPESAFE_API_KEY")
 
 
-def _response(confidence: float = 0.85, exit_noul: float = 0.1) -> Response:
-    buy = {"type": "choice", "choice": "buy", "probabilities": {"buy": 0.9, "sell": 0.02, "hold": 0.08}, "confidence": confidence}
-    raw = {
-        "regime": {"type": "choice", "choice": "trending_up", "probabilities": {"trending_up": .8, "trending_down": .05, "ranging": .1, "disorderly": .05}, "confidence": .7},
-        "flow_control": {"type": "choice", "choice": "buyers", "probabilities": {"buyers": .9, "sellers": .05, "neither": .05}, "confidence": .85},
-        "book_pressure": {"type": "choice", "choice": "up", "probabilities": {"up": .8, "down": .1, "neutral": .1}, "confidence": .7},
-        "candle_close": {"type": "choice", "choice": "up", "probabilities": {"up": .7, "down": .1, "unclear": .2}, "confidence": .55},
-        "informed_flow": {"type": "noul", "noul": .8}, "price_lagging_flow": {"type": "noul", "noul": .9},
-        "exit_now": {"type": "noul", "noul": exit_noul},
-        "liquidity_stress": {"type": "score", "score": .4, "probabilities": {"0": .6, "1": .4, "2": 0}, "confidence": .4},
-        "setup_quality": {"type": "score", "score": 3.1, "probabilities": {"0": 0, "1": 0, "2": .1, "3": .7, "4": .2}, "confidence": .6},
-        "action": buy, "action_alt": buy, "action_contrarian_check": buy,
-    }
+def _noul(value: float) -> dict:
+    return {"type": "noul", "noul": value}
+
+
+def _response(**overrides: float) -> Response:
+    """A clean buy: every buy-side Noul is yes, every other Noul is no."""
+    raw = {key: _noul(0.05) for key in QUESTION_IDS}
+    for key in BUY_SIDE:
+        raw[key] = _noul(0.9)
+    raw.update({key: _noul(value) for key, value in overrides.items()})
     return Response("scripted", {k: Answer.from_json(v) for k, v in raw.items()})
 
 
@@ -754,7 +752,9 @@ class Session(_CleanEnv):
         self.assertNotIn("55667788", text)
         self.assertNotIn("RoboForex-Demo", text)
         self.assertEqual(fake.orders, [])
-        self.assertEqual(jev.states[0]["order_book"]["best_level"], "roughly even queues")
+        self.assertEqual(set(jev.states[0]["order_book"]), {"spread"})
+        self.assertNotIn("best_level", jev.states[0]["order_book"])
+        self.assertEqual(jev.states[0]["data_quality"]["book_signals"], "degraded")
         self.assertTrue(all(isinstance(v, str) for v in _leaves(jev.states[0])))
         self.assertEqual(fake.init_kwargs["password"], "s3cret-password")
         own = {k: v for k, v in session.broker.__dict__.items() if k != "_mod"}
@@ -783,13 +783,15 @@ class Session(_CleanEnv):
 
     def test_half_size_below_the_minimum_and_a_wide_spread_are_blocked(self):
         fake = FakeMT5()
-        session = _ready(fake, _cfg(dry_run=False), ScriptedJev([_response(confidence=0.5)]))
+        session = _ready(fake, _cfg(dry_run=False), ScriptedJev([_response()]))
+        fake.symbols["XAUUSD"].volume_min = 0.02
         t = _prefill(session)
         buf = io.StringIO()
         with redirect_stdout(buf):
             session.on_bar(_bar(t), self._now())
         self.assertEqual(fake.orders, [])
         self.assertIn("minimum", buf.getvalue())
+        fake = FakeMT5()
         fake.quote["ask"] = 2001.0
         session = _ready(fake, _cfg(dry_run=False), ScriptedJev([_response()]))
         t = _prefill(session)
@@ -1133,6 +1135,9 @@ class Cli(_CleanEnv):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(captured["body"]["model"], "jev-latest")
         self.assertEqual(captured["body"]["state"]["data_quality"]["book_signals"], "degraded")
+        self.assertNotIn("best_level", captured["body"]["state"]["order_book"])
+        self.assertTrue(all(q["type"] == "noul" for q in captured["body"]["questions"].values()))
+        self.assertNotIn("Authorization", json.dumps(jev.last_payload))
         self.assertIn("first answer · model jev-1.13.0", text)
         self.assertNotIn(token, text)
         self.assertEqual(fake.orders, [])
@@ -1146,6 +1151,8 @@ class Cli(_CleanEnv):
             session.on_bar(_bar(t + 1), now)
         text = buf.getvalue()
         self.assertIn("holding", text)
+        self.assertIn("jev request payload", text)
+        self.assertIn("\"model\":\"jev-latest\"", text)
         self.assertNotIn(token, text)
         self.assertIn("***", text)
         self.assertEqual(fake.orders, [])
@@ -1185,26 +1192,8 @@ def _live_args(*extra):
 
 def _sell_response():
     response = _response()
-    response.answers["regime"] = Answer.from_json({
-        "type": "choice", "choice": "trending_down",
-        "probabilities": {"trending_up": 0.05, "trending_down": 0.8, "ranging": 0.1, "disorderly": 0.05},
-        "confidence": 0.7,
-    })
-    response.answers["flow_control"] = Answer.from_json({
-        "type": "choice", "choice": "sellers",
-        "probabilities": {"buyers": 0.05, "sellers": 0.9, "neither": 0.05}, "confidence": 0.85,
-    })
-    response.answers["book_pressure"] = Answer.from_json({
-        "type": "choice", "choice": "down",
-        "probabilities": {"up": 0.1, "down": 0.8, "neutral": 0.1}, "confidence": 0.7,
-    })
-    response.answers["candle_close"] = Answer.from_json({
-        "type": "choice", "choice": "down",
-        "probabilities": {"up": 0.1, "down": 0.7, "unclear": 0.2}, "confidence": 0.55,
-    })
-    raw = {"type": "choice", "choice": "sell", "probabilities": {"buy": 0.02, "sell": 0.9, "hold": 0.08}, "confidence": 0.85}
-    for key in ("action", "action_alt", "action_contrarian_check"):
-        response.answers[key] = Answer.from_json(raw)
+    for up, down in zip(BUY_SIDE, SELL_SIDE):
+        response.answers[up], response.answers[down] = response.answers[down], response.answers[up]
     return response
 
 

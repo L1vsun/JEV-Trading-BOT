@@ -1,4 +1,4 @@
-"""Quant divergence flags: the code-side twin of Jev's ``price_lagging_flow``.
+"""Quant divergence flags: the code-side twin of the fair-value gap.
 
 The fair-value model (quant.FairValueModel) predicts where the mid should be
 in a few minutes; when that prediction stays large for a while, Jev raises a

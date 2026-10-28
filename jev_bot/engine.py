@@ -18,7 +18,7 @@ from .book import Market
 from .decide import Decision, Policy, decide
 from .features import feature_matrix
 from .quant import CandleModel, FairValueModel, candle_inputs
-from .questions import decision_questions
+from .questions import decision_questions, state_for_model
 from .signals import Flag, detect_flags
 from .state import StateBuilder
 from .typesafe import JevError, SystemOne
@@ -126,12 +126,13 @@ def run(m: Market, jev: SystemOne, cfg: RunConfig | None = None, policy: Policy 
             close(t, "max hold")
         # decision tick
         if t in tick_set:
-            st = sb.state(t, _position_text(pos, t, open_tr, mid[t]))
+            st = state_for_model(sb.state(t, _position_text(pos, t, open_tr, mid[t])))
             try:
                 r = jev.system_one(st, qs)
             except JevError as e:
                 if progress:
                     print(f"  t={t}: Jev error {e}; holding")
+                decisions.append(Decision(t, "hold", 0.0, 0.0, {"answers_present": False}, "jev unavailable", {}))
                 continue
             d = decide(t, r, pos, policy)
             d.answers["_state"] = st

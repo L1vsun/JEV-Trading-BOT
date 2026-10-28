@@ -15,7 +15,7 @@ from jev_bot.book import Market, load_csv
 from jev_bot.decide import Policy, decide
 from jev_bot.engine import RunConfig, run
 from jev_bot.quant import RLS, FairValueModel
-from jev_bot.questions import decision_questions
+from jev_bot.questions import BUY_SIDE, QUESTION_IDS, SELL_SIDE, decision_questions
 from jev_bot.sim import SimConfig, simulate
 from jev_bot.state import FLOW, StateBuilder, bucket, value_of
 from jev_bot.surrogate import JevSurrogate
@@ -128,43 +128,57 @@ def fake(answers: dict) -> Response:
     return Response("test", {k: Answer.from_json(v) for k, v in answers.items()})
 
 
-BUY = {"type": "choice", "choice": "buy", "probabilities": {"buy": 0.9, "sell": 0.02, "hold": 0.08}, "confidence": 0.85}
-BASE = {
-    "regime": {"type": "choice", "choice": "trending_up", "probabilities": {"trending_up": .8, "trending_down": .05, "ranging": .1, "disorderly": .05}, "confidence": .7},
-    "flow_control": {"type": "choice", "choice": "buyers", "probabilities": {"buyers": .9, "sellers": .05, "neither": .05}, "confidence": .85},
-    "book_pressure": {"type": "choice", "choice": "up", "probabilities": {"up": .8, "down": .1, "neutral": .1}, "confidence": .7},
-    "candle_close": {"type": "choice", "choice": "up", "probabilities": {"up": .7, "down": .1, "unclear": .2}, "confidence": .55},
-    "informed_flow": {"type": "noul", "noul": .8}, "price_lagging_flow": {"type": "noul", "noul": .9}, "exit_now": {"type": "noul", "noul": .1},
-    "liquidity_stress": {"type": "score", "score": .4, "probabilities": {"0": .6, "1": .4, "2": 0}, "confidence": .4},
-    "setup_quality": {"type": "score", "score": 3.1, "probabilities": {"0": 0, "1": 0, "2": .1, "3": .7, "4": .2}, "confidence": .6},
-    "action": BUY, "action_alt": BUY, "action_contrarian_check": BUY,
-}
+def _noul(value: float) -> dict:
+    return {"type": "noul", "noul": value}
+
+
+def _table(**overrides: float) -> dict:
+    raw = {key: _noul(0.05) for key in QUESTION_IDS}
+    for key in BUY_SIDE:
+        raw[key] = _noul(0.9)
+    raw.update({key: _noul(value) for key, value in overrides.items()})
+    return raw
 
 
 class Decide(unittest.TestCase):
     def test_all_gates_pass_buys_full_size(self):
-        d = decide(0, fake(BASE), 0)
+        d = decide(0, fake(_table()), 0)
         self.assertEqual((d.action, d.size), ("buy", 1.0))
         self.assertTrue(all(d.gates.values()))
+        self.assertEqual(d.composite, 1.0)
 
-    def test_self_consistency_blocks(self):
-        a = dict(BASE, action_contrarian_check={**BUY, "choice": "hold", "probabilities": {"buy": .3, "sell": .1, "hold": .6}})
-        d = decide(0, fake(a), 0)
+    def test_unsettled_band_holds(self):
+        d = decide(0, fake(_table(tape_buys_up=0.5)), 0, Policy())
         self.assertEqual(d.action, "hold")
-        self.assertFalse(d.gates["consistent"])
+        self.assertIn("unsettled", d.reason)
+        self.assertFalse(d.gates["settled"])
 
-    def test_low_confidence_blocks(self):
-        low = {**BUY, "confidence": 0.1}
-        d = decide(0, fake(dict(BASE, action=low, action_alt=low, action_contrarian_check=low)), 0)
+    def test_missing_answer_is_not_a_no(self):
+        raw = _table()
+        del raw["flow_up"]
+        d = decide(0, fake(raw), 0)
         self.assertEqual(d.action, "hold")
+        self.assertIn("missing", d.reason)
+        self.assertIn("not read as no", d.reason)
+        self.assertNotIn("flow_up no", d.reason)
 
-    def test_medium_confidence_half_size(self):
-        mid = {**BUY, "confidence": 0.5}
-        d = decide(0, fake(dict(BASE, action=mid)), 0, Policy())
-        self.assertEqual((d.action, d.size), ("buy", 0.5))
+    def test_liquidity_veto_holds(self):
+        d = decide(0, fake(_table(spread_wide=0.9)), 0)
+        self.assertEqual(d.action, "hold")
+        self.assertIn("veto", d.reason)
+
+    def test_sell_side_and_already_long(self):
+        raw = {key: _noul(0.05) for key in QUESTION_IDS}
+        for key in SELL_SIDE:
+            raw[key] = _noul(0.9)
+        d = decide(0, fake(raw), 0)
+        self.assertEqual((d.action, d.size), ("sell", 1.0))
+        held = decide(0, fake(_table()), 1)
+        self.assertEqual(held.action, "hold")
+        self.assertIn("already long", held.reason)
 
     def test_exit(self):
-        d = decide(0, fake(dict(BASE, exit_now={"type": "noul", "noul": .9})), 1)
+        d = decide(0, fake(_table(**{"exit_against_long": 0.9})), 1)
         self.assertEqual(d.action, "exit")
 
 
@@ -233,6 +247,8 @@ class Client(unittest.TestCase):
             with self.assertRaises(JevError):
                 off.system_one({"x": "other"}, qs)
             self.assertEqual(c.models()[0]["name"], "jev-latest")
+            self.assertEqual(c.last_payload["model"], "jev-latest")
+            self.assertNotIn("Authorization", json.dumps(c.last_payload))
 
     def test_schema_validation(self):
         with self.assertRaises(ValueError):

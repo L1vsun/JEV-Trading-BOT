@@ -1,82 +1,258 @@
-"""The questions Jev answers on every decision tick.
+"""Questions, thresholds and the truth table for one live decision.
 
-One request carries all of them (speculative fan-out: they are evaluated in
-parallel, so the exit question is asked even when flat and simply ignored).
-Each question is atomic, literal and points at the state field it needs by
-name in backticks, following the Jev 1.13 guidance on literal reading and
-indirection. Arithmetic stays in code.
+Jev answers one observable statement per question. This module maps those
+answers onto buy, sell, hold or exit. Confidence is not a gate. A missing
+answer is an error and holds; it is not read as a no.
+
+Noul bands, from the TypeSafe starting point:
+
+* ``noul >= 0.7`` is yes
+* ``noul <= 0.3`` is no
+* anything between is unsettled, and the row for that band is hold
 """
 from __future__ import annotations
 
-from .typesafe import Choice, Noul, Question, Score
+from dataclasses import dataclass
 
-ACTION_OPTIONS = {
-    "buy": "Order flow, the book and the fair value gap all point up, so a long position is justified now",
-    "sell": "Order flow, the book and the fair value gap all point down, so a short position is justified now",
-    "hold": "The evidence is mixed, weak or contradictory, so no new position",
-}
+from .typesafe import Noul, Question, Response
+
+YES = 0.7
+NO = 0.3
+
+BUY_SIDE = (
+    "tape_buys_up",
+    "trend_up",
+    "flow_up",
+    "candle_up",
+    "price_below_flow",
+)
+SELL_SIDE = (
+    "tape_sells_down",
+    "trend_down",
+    "flow_down",
+    "candle_down",
+    "price_above_flow",
+)
+VETOES = ("spread_wide", "volatility_violent")
+EXIT_LONG = "exit_against_long"
+EXIT_SHORT = "exit_against_short"
+QUESTION_IDS = BUY_SIDE + SELL_SIDE + VETOES + (EXIT_LONG, EXIT_SHORT)
+
+
+def _noul(question: str, yes: str, no: str) -> Noul:
+    return Noul(question, {"true": yes, "false": no})
 
 
 def decision_questions() -> dict[str, Question]:
+    """One judgment each. No question asks what the trader should do."""
     return {
-        # --- market regime and who is in control
-        "regime": Choice(
-            instructions="Which regime best describes `price_action` together with `volatility`?",
-            criteria={
-                "trending_up": "Price is moving higher in a sustained way",
-                "trending_down": "Price is moving lower in a sustained way",
-                "ranging": "Price is going sideways without direction",
-                "disorderly": "Moves are violent and erratic with no clear direction",
-            }),
-        "flow_control": Choice(
-            instructions="Who is in control of `order_flow` right now?",
-            criteria={"buyers": "Buying aggression dominates", "sellers": "Selling aggression dominates",
-                      "neither": "Buying and selling are roughly balanced"}),
-        # --- the microstructure edge
-        "informed_flow": Noul(
-            instructions="Does `order_flow.aggressor_tape_30s_windows_oldest_first` show the same side "
-                         "aggressing window after window, with `flow_toxicity` elevated or extreme?",
-            criteria={"true": "Persistent one-sided aggression with elevated toxicity",
-                      "false": "Aggression switches sides or toxicity is low or normal"}),
-        "price_lagging_flow": Noul(
-            instructions={
-                "question": "Is the price lagging behind the order flow, so that `fair_value_gap` describes "
-                            "a gap that the price has not closed yet?",
-                "note": "A gap exists only when `fair_value_gap` is not 'price is in line with fair value'.",
-            },
-            criteria={"true": "Price is clearly away from where the flow says it should be",
-                      "false": "Price is in line with the flow"}),
-        "book_pressure": Choice(
-            instructions="Which way does `order_book` lean, using `best_level`, `top_five_levels` and `micro_price`? "
-                         "If `data_quality.book_signals` is degraded, those three fields are placeholders from a "
-                         "level-1 book and do not show a real queue.",
-            criteria={"up": "The book favours the price ticking up", "down": "The book favours the price ticking down",
-                      "neutral": "The book is balanced"}),
-        # --- reading the forming candle
-        "candle_close": Choice(
-            instructions="Judging only by the shape of `forming_candle`, how will this candle most likely close?",
-            criteria={"up": "Close above its open", "down": "Close below its open", "unclear": "Too early or too mixed to tell"}),
-        # --- risk
-        "liquidity_stress": Score(
-            instructions="How stressed is liquidity, from `order_book.spread`, `volatility` and `flow_toxicity`?",
-            criteria=["Calm: tight spread, normal volatility, low or normal toxicity",
-                      "Strained: one of spread, volatility or toxicity is elevated",
-                      "Stressed: wide spread or very volatile with extreme toxicity"]),
-        "setup_quality": Score(
-            instructions="How strong is the case for opening a position now, if every field agrees on one direction?",
-            criteria=["No setup: fields disagree", "Weak: a few fields agree", "Decent: most fields agree",
-                      "Strong: flow, book and fair value gap agree", "Exceptional: everything agrees and the gap is large"]),
-        # --- the decision itself, asked three ways for self-consistency
-        "action": Choice(instructions="What should the trader do now?", criteria=ACTION_OPTIONS),
-        "action_alt": Choice(
-            instructions={"question": "Given `order_flow`, `order_book` and `fair_value_gap`, pick the trade.",
-                          "rule": "Only choose buy or sell when all three point the same way."},
-            criteria=ACTION_OPTIONS),
-        "action_contrarian_check": Choice(
-            instructions="A skeptical risk manager reviews this state. Which trade, if any, would they approve?",
-            criteria=ACTION_OPTIONS),
-        # --- speculative: only read when a position is open
-        "exit_now": Noul(
-            instructions="Given `position`, has the order flow turned against it or has the `fair_value_gap` closed?",
-            criteria={"true": "Flow now opposes the position or the gap is gone", "false": "The reason for the position still holds"}),
+        "tape_buys_up": _noul(
+            "Do the later windows in `order_flow.aggressor_tape_30s_windows_oldest_first` show aggressive buying?",
+            "Those windows are light buying, moderate buying or heavy buying.",
+            "Those windows are balanced or any kind of selling.",
+        ),
+        "tape_sells_down": _noul(
+            "Do the later windows in `order_flow.aggressor_tape_30s_windows_oldest_first` show aggressive selling?",
+            "Those windows are light selling, moderate selling or heavy selling.",
+            "Those windows are balanced or any kind of buying.",
+        ),
+        "trend_up": _noul(
+            "Is price rising in `price_action.last_5_minutes`?",
+            "It is drifting higher, rising steadily or rising fast.",
+            "It is flat, drifting lower, falling steadily or falling fast.",
+        ),
+        "trend_down": _noul(
+            "Is price falling in `price_action.last_5_minutes`?",
+            "It is drifting lower, falling steadily or falling fast.",
+            "It is flat, drifting higher, rising steadily or rising fast.",
+        ),
+        "flow_up": _noul(
+            "Is `order_flow.last_1_minute` buying?",
+            "It is light buying, moderate buying or heavy buying.",
+            "It is balanced, light selling, moderate selling or heavy selling.",
+        ),
+        "flow_down": _noul(
+            "Is `order_flow.last_1_minute` selling?",
+            "It is light selling, moderate selling or heavy selling.",
+            "It is balanced, light buying, moderate buying or heavy buying.",
+        ),
+        "candle_up": _noul(
+            "Is `forming_candle.so_far` up?",
+            "It is up slightly, up moderately or up sharply.",
+            "It is unchanged, down slightly, down moderately or down sharply.",
+        ),
+        "candle_down": _noul(
+            "Is `forming_candle.so_far` down?",
+            "It is down slightly, down moderately or down sharply.",
+            "It is unchanged, up slightly, up moderately or up sharply.",
+        ),
+        "price_below_flow": _noul(
+            "Does `fair_value_gap` place the price below fair value?",
+            "It says slightly below fair value, below where the order flow says it should be, or far below that.",
+            "It says the price is in line with fair value or above it.",
+        ),
+        "price_above_flow": _noul(
+            "Does `fair_value_gap` place the price above fair value?",
+            "It says slightly above fair value, above where the order flow says it should be, or far above that.",
+            "It says the price is in line with fair value or below it.",
+        ),
+        "spread_wide": _noul(
+            "Is `order_book.spread` wide?",
+            "The spread is wide or very wide.",
+            "The spread is one tick, tight, or two ticks, normal.",
+        ),
+        "volatility_violent": _noul(
+            "Is `volatility` very volatile?",
+            "Volatility is very volatile.",
+            "Volatility is very calm, calm, normal or volatile.",
+        ),
+        "exit_against_long": _noul(
+            "Is `order_flow.last_1_minute` selling while `position` is a long?",
+            "The position starts with long, and the one-minute flow is light, moderate or heavy selling.",
+            "The position is flat or short, or the one-minute flow is balanced or buying.",
+        ),
+        "exit_against_short": _noul(
+            "Is `order_flow.last_1_minute` buying while `position` is a short?",
+            "The position starts with short, and the one-minute flow is light, moderate or heavy buying.",
+            "The position is flat or long, or the one-minute flow is balanced or selling.",
+        ),
     }
+
+
+def state_for_model(state: dict) -> dict:
+    """The fields the questions name, and nothing else.
+
+    Queue imbalance, depth and micro-price are left out. On a level-1 book
+    those strings are placeholders, and a placeholder must not count as a
+    queue. Spread stays, because it is the bid-ask quote.
+    """
+    flow = state.get("order_flow") or {}
+    price = state.get("price_action") or {}
+    book = state.get("order_book") or {}
+    candle = state.get("forming_candle") or {}
+    out = {
+        "price_action": {"last_5_minutes": price.get("last_5_minutes", "")},
+        "order_flow": {
+            "last_1_minute": flow.get("last_1_minute", ""),
+            "aggressor_tape_30s_windows_oldest_first": list(flow.get("aggressor_tape_30s_windows_oldest_first") or []),
+        },
+        "order_book": {"spread": book.get("spread", "")},
+        "volatility": state.get("volatility", ""),
+        "fair_value_gap": state.get("fair_value_gap", ""),
+        "forming_candle": {"so_far": candle.get("so_far", "")},
+        "position": state.get("position", "flat"),
+    }
+    if "data_quality" in state:
+        out["data_quality"] = state["data_quality"]
+    return out
+
+
+@dataclass(frozen=True)
+class Policy:
+    """The two Noul cuts. The band between them is its own row: hold."""
+
+    yes: float = YES
+    no: float = NO
+
+
+@dataclass
+class Decision:
+    t: int
+    action: str                  # buy | sell | hold | exit
+    size: float                  # 0 or 1
+    composite: float             # trace of the pairs, not a gate
+    gates: dict[str, bool]
+    reason: str
+    answers: dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.answers is None:
+            self.answers = {}
+
+
+def _reading(response: Response, key: str) -> float | None:
+    """The Noul, or None when the answer is missing or not a Noul.
+
+    None is an error. Callers must not treat it as zero.
+    """
+    answer = response.answers.get(key)
+    if answer is None or answer.type != "noul" or answer.noul is None:
+        return None
+    return float(answer.noul)
+
+
+def _band(value: float | None, policy: Policy) -> str:
+    if value is None:
+        return "missing"
+    if value >= policy.yes:
+        return "yes"
+    if value <= policy.no:
+        return "no"
+    return "mid"
+
+
+def composite_trace(labels: dict[str, str]) -> float:
+    """Mean of +1 / -1 / 0 across the five pairs. Visible in the log, not a gate."""
+    score = 0
+    for up, down in zip(BUY_SIDE, SELL_SIDE):
+        if labels.get(up) == "yes" and labels.get(down) == "no":
+            score += 1
+        elif labels.get(down) == "yes" and labels.get(up) == "no":
+            score -= 1
+    return score / len(BUY_SIDE)
+
+
+def decide(t: int, response: Response, position: int, policy: Policy | None = None) -> Decision:
+    """Every band combination has a row. The action is never read off confidence."""
+    policy = policy or Policy()
+    labels = {key: _band(_reading(response, key), policy) for key in QUESTION_IDS}
+    answers = {key: answer.to_json() for key, answer in response.answers.items()}
+    trace = composite_trace(labels)
+    missing = [key for key, band in labels.items() if band == "missing"]
+
+    def row(action: str, size: float, reason: str, **gates: bool) -> Decision:
+        base = {
+            "answers_present": not missing,
+            "exit_clear": True,
+            "settled": True,
+            "liquidity_clear": True,
+            "one_side": action in ("buy", "sell"),
+        }
+        base.update(gates)
+        return Decision(t, action, size, trace, base, reason, answers)
+
+    if missing:
+        return row("hold", 0.0, "hold: answer missing (" + ", ".join(missing) + "); not read as no",
+                   answers_present=False, exit_clear=False, settled=False, liquidity_clear=False)
+
+    exit_key = EXIT_LONG if position > 0 else EXIT_SHORT if position < 0 else None
+    if exit_key is not None:
+        band = labels[exit_key]
+        if band == "yes":
+            return row("exit", 0.0, f"exit: {exit_key} >= {policy.yes:g}", exit_clear=False, one_side=False)
+        if band == "mid":
+            return row("hold", 0.0, f"hold: {exit_key} unsettled ({policy.no:g} to {policy.yes:g})",
+                       exit_clear=False, one_side=False)
+
+    directional = BUY_SIDE + SELL_SIDE + VETOES
+    if any(labels[key] == "mid" for key in directional):
+        names = [key for key in directional if labels[key] == "mid"]
+        return row("hold", 0.0, "hold: unsettled (" + ", ".join(names) + ")", settled=False, one_side=False)
+
+    if any(labels[key] == "yes" for key in VETOES):
+        names = [key for key in VETOES if labels[key] == "yes"]
+        return row("hold", 0.0, "hold: liquidity veto (" + ", ".join(names) + ")", liquidity_clear=False, one_side=False)
+
+    buy = all(labels[key] == "yes" for key in BUY_SIDE) and all(labels[key] == "no" for key in SELL_SIDE)
+    sell = all(labels[key] == "yes" for key in SELL_SIDE) and all(labels[key] == "no" for key in BUY_SIDE)
+    if buy and sell:
+        return row("hold", 0.0, "hold: both sides", one_side=False)
+    if buy:
+        if position > 0:
+            return row("hold", 0.0, "hold: already long", one_side=False)
+        return row("buy", 1.0, f"buy: buy-side >= {policy.yes:g}, sell-side <= {policy.no:g}, vetoes no")
+    if sell:
+        if position < 0:
+            return row("hold", 0.0, "hold: already short", one_side=False)
+        return row("sell", 1.0, f"sell: sell-side >= {policy.yes:g}, buy-side <= {policy.no:g}, vetoes no")
+    return row("hold", 0.0, "hold: no setup", one_side=False)

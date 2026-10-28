@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .book import load_csv
 from .engine import RunConfig, run
-from .questions import decision_questions
+from .questions import decision_questions, state_for_model
 from .sim import SimConfig, simulate
 from .surrogate import JevSurrogate
 from .typesafe import JevClient, JevError, ResponseCache
@@ -123,7 +123,7 @@ def cmd_paper(args) -> None:
     for t in range(args.warmup, len(m) - 1, args.step):
         t0 = time.perf_counter()
         pos_txt = "flat" if not pos else f"{'long' if pos > 0 else 'short'} for {(t - t_in) // 60} min, currently {'in profit' if (raw['mid'][t] - px_in) * pos > 0 else 'at a loss'}"
-        r = jev.system_one(sb.state(t, pos_txt), qs)
+        r = jev.system_one(state_for_model(sb.state(t, pos_txt)), qs)
         d = decide(t, r, pos)
         ms = (time.perf_counter() - t0) * 1000
         if d.action in ("exit", "buy", "sell") and pos and (d.action == "exit" or (d.action == "buy") != (pos > 0)):
@@ -144,7 +144,7 @@ def cmd_paper(args) -> None:
 def cmd_ask(args) -> None:
     jev = make_jev(args)
     state = json.loads(Path(args.state).read_text())
-    r = jev.system_one(state, decision_questions())
+    r = jev.system_one(state_for_model(state), decision_questions())
     print(f"model {r.model} · {r.input_tokens} input tokens · {r.latency_ms:.0f} ms")
     for k, a in r.answers.items():
         if a.type == "noul":
