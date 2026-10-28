@@ -46,6 +46,7 @@ from .risk import (
     build_order,
     check_entry,
     format_intent,
+    equity_lot_stage,
     lot_stage_table,
     parse_avoid_hours,
     position_text,
@@ -631,7 +632,6 @@ class LiveSession:
         if scaling.mode == LOT_MODE_FIXED:
             self._log(f"lot · mode fixed · lot {self.effective_lot():g} (--lot)")
             return
-        from .risk import equity_lot_stage
         spec = self.broker.spec()
         rows = lot_stage_table(
             max_equity=20_000.0,
