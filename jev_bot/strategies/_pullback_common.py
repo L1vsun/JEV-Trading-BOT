@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..bars import Bar, TF_SECONDS
+from ..bars import Bar
 from ..indicators import (
     adx14,
     atr14,
@@ -22,6 +22,7 @@ from .common import MarketContext, Policy, Signal, noul, reading
 from .mtf_base import (
     cost_gate,
     entry_signal,
+    hold_override_for,
     hold_seconds_for,
     hold_signal,
     labels_for,
@@ -515,8 +516,7 @@ def _risk(ctx: MarketContext, cfg: PullbackConfig, setup: dict) -> tuple[float, 
         return hold_signal(cfg.name, f"{cfg.name}: {why}")
     tp_pts = tp_from_rr(sl_pts, TP_RR)
     global_hold = int(getattr(ctx, "max_hold_seconds", 0) or getattr(lim, "global_max_hold", 900) or 0)
-    tf_sec = TF_SECONDS.get(cfg.tf, 300)
-    override = cfg.max_bars * tf_sec
+    override = hold_override_for(cfg.name, limits=lim, ctx=ctx)
     hold = hold_seconds_for(cfg.tf, cfg.max_bars, global_hold, override=override)
     return sl_pts, tp_pts, hold
 

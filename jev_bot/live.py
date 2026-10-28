@@ -11,10 +11,16 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from .bars import DEFAULT_BACKFILL, MultiTFBooks, TF_ENUM
+from .bars import DEFAULT_BACKFILL, Bar, MultiTFBooks, TF_ENUM, TF_SECONDS, candle_open
 from .features import feature_matrix
 from .mt5_feed import MarketBuffer, Tick, TickAggregator, depth_note
 from .quant import FairValueModel
+from .session_guard import (
+    EntryWindow,
+    allows_entry,
+    is_sunday_stub,
+    should_flatten_weekend,
+)
 from .state import StateBuilder
 from .strategies import StrategyFlags, StrategyRouter, build_context
 from .strategies.magics import (
@@ -49,7 +55,57 @@ from .risk import (
     scaled_lot,
     stop_exit,
 )
-from .typesafe import JevError, payload_text
+from .typesafe import Answer, JevError, Response, payload_text
+
+# Closed bars needed before ATR-based MTF strategies can leave hold.
+_MTF_ATR_HISTORY_NEED = 30
+
+# Strategy name → signal timeframe for the Jev candle-close cache.
+# ``1s`` means every decision bar (consensus / vwap / orb / PA).
+_STRATEGY_SIGNAL_TF: dict[str, str] = {
+    "consensus": "1s",
+    "vwap_fade": "1s",
+    "orb_london": "1s",
+    "pa_rejection": "1s",
+    "pa_insidebar": "1s",
+    "pa_structure": "1s",
+    "m5_ny_orb": "M5",
+    "m5_asianbox": "M5",
+    "m5_vwap_pb": "M5",
+    "m15_ny_orb": "M15",
+    "m15_asia_squeeze": "M15",
+    "m15_trend_pullback": "M15",
+    "h1_trend_long": "H1",
+    "h1_pullback": "H1",
+    "h1_prevday_break": "H1",
+    "h4_donchian": "H4",
+    "h4_ema_pullback": "H4",
+    "h4_zone_retest": "H4",
+    "pullback_m1": "M1",
+    "pullback_m5": "M5",
+    "pullback_m15": "M15",
+    "pullback_h1": "H1",
+    "pullback_h4": "H4",
+}
+
+
+def signal_tf_for(strategy: str) -> str:
+    """Map a strategy name to its signal TF (``M5``…``H4``, ``M1``, or ``1s``)."""
+    if strategy in _STRATEGY_SIGNAL_TF:
+        return _STRATEGY_SIGNAL_TF[strategy]
+    if strategy.startswith("m5_"):
+        return "M5"
+    if strategy.startswith("m15_"):
+        return "M15"
+    if strategy.startswith("h1_"):
+        return "H1"
+    if strategy.startswith("h4_"):
+        return "H4"
+    if strategy.startswith("pullback_"):
+        tag = strategy.split("_", 1)[-1].upper()
+        if tag in TF_SECONDS:
+            return tag
+    return "1s"
 
 
 @dataclass
@@ -160,6 +216,8 @@ class LiveConfig:
     allow_short: bool = False
     h4_ema_allow_short: bool = False
     h1_use_sma50_200: bool = False
+    hold_over_weekend: bool = False
+    hold_overrides: dict[str, int] = field(default_factory=dict)
 
 
 def parse_magic_offset_json(text: str | None) -> dict[str, int]:
@@ -249,6 +307,11 @@ def live_config_from_args(args) -> LiveConfig:
             "--sig-pa-rejection / --sig-pa-insidebar / an MTF name"
         )
 
+    hold_overrides = dict(getattr(args, "hold_overrides", None) or {})
+    for name, secs in hold_overrides.items():
+        if int(secs) < 0:
+            raise RiskError(f"hold override for {name!r} must be >= 0")
+
     mtf = default_mtf_limits()
     min_sl = dict(mtf.min_sl_points)
     for tf, attr in (("M5", "min_sl_m5"), ("M15", "min_sl_m15"), ("H1", "min_sl_h1"), ("H4", "min_sl_h4")):
@@ -265,6 +328,7 @@ def live_config_from_args(args) -> LiveConfig:
         allow_short=allow_short,
         global_max_hold=hold,
         max_spread_points=float(limits.max_spread_points),
+        hold_overrides=dict(hold_overrides),
     )
 
     backfill = getattr(args, "backfill", None) or dict(DEFAULT_BACKFILL)
@@ -281,6 +345,8 @@ def live_config_from_args(args) -> LiveConfig:
         allow_short=allow_short,
         h4_ema_allow_short=bool(getattr(args, "h4_ema_allow_short", False)),
         h1_use_sma50_200=bool(getattr(args, "h1_sma50_200", False)),
+        hold_over_weekend=bool(getattr(args, "hold_over_weekend", False)),
+        hold_overrides=dict(hold_overrides),
     )
 
 
@@ -329,6 +395,11 @@ class LiveSession:
         self._session_lot: float | None = None
         self._lot_day = None
         self._lot_equity: float | None = None
+        self.entry_window = EntryWindow()
+        # Jev candle-close cache: (strategy, candle_open_t) → Response (answer subset).
+        self._jev_cache: dict[tuple[str, int], Response] = {}
+        self._mtf_hist_warned: set[str] = set()
+        self._swap_logged = False
 
     def magic_of(self, strategy: str) -> int:
         return magic_for(strategy, self.cfg.magic, self.cfg.magic_offsets or None)
@@ -508,13 +579,15 @@ class LiveSession:
             f" · h4_ema_allow_short={'on' if self.cfg.h4_ema_allow_short else 'off'}"
             f" · h1_sma50_200={'on' if self.cfg.h1_use_sma50_200 else 'off'}"
         )
+        hold_ow = "on" if self.cfg.hold_over_weekend else "off"
         self._log(
             f"limits · lot {self.effective_lot():g} · max_lots {self.limits.max_lots:g} · "
             f"max_positions {self.limits.max_positions} · no_hedge={'on' if self.cfg.no_hedge else 'off'} · "
             f"max_spread {self.limits.max_spread_points:g} · {_shown('sl_points', self.limits.sl_points)} · "
             f"{_shown('tp_points', self.limits.tp_points)} · deviation {self.limits.deviation_points} · "
             f"{_shown('max_hold_seconds', self.cfg.max_hold_seconds)} · avoid_hours {avoid} · "
-            f"hours {self.cfg.hours} · step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
+            f"hours {self.cfg.hours} · hold_over_weekend {hold_ow} · "
+            f"step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
             f"contract {spec.contract_size:g} · point {spec.point:g} · magic_base {self.cfg.magic}"
         )
         self._log(f"strategies · {', '.join(names) if names else '(none)'}{mtf_note}")
@@ -522,7 +595,11 @@ class LiveSession:
         if entry:
             parts = [f"{n}={self.magic_of(n)}" for n in entry]
             self._log(f"magics · {', '.join(parts)}")
+        if self.cfg.hold_overrides:
+            parts = [f"{k}={v}s" for k, v in sorted(self.cfg.hold_overrides.items())]
+            self._log(f"hold_overrides · {', '.join(parts)}")
         self._log_lot_table()
+        self._log_swap()
         if self.broker.trade_mode() == "real":
             self._log("REAL MONEY: orders will be sent on this account")
         else:
@@ -530,6 +607,24 @@ class LiveSession:
                 f"DEMO/CONTEST: orders will still be sent (--allow-real + confirm required)"
             )
         self._log(self.broker.clock_text())
+
+    def _log_swap(self) -> None:
+        """Dashboard-compatible swap line when the broker exposes the fields."""
+        swap_fn = getattr(self.broker, "swap_rates", None)
+        if not callable(swap_fn):
+            return
+        try:
+            rates = swap_fn()
+        except Exception:
+            return
+        if rates is None:
+            return
+        try:
+            long_s, short_s = float(rates[0]), float(rates[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        self._swap_logged = True
+        self._log(f"swap · long={long_s:g} short={short_s:g}")
 
     def _log_lot_table(self) -> None:
         scaling = self.cfg.lot_scaling
@@ -582,32 +677,167 @@ class LiveSession:
             if tf_enum is None:
                 continue
             try:
-                rows = copy_fn(self.broker.symbol, tf_enum, 0, int(count))
+                # start_pos=1 skips the still-forming candle (pos 0).
+                rows = copy_fn(self.broker.symbol, tf_enum, 1, int(count))
             except Exception as exc:
                 self._log(f"mtf · {tf} backfill failed: {redact(str(exc))}")
                 continue
             if not rows:
                 self._log(f"mtf · {tf} backfill empty")
+                self._warn_mtf_history(tf, 0)
                 continue
             builder = self.mtf_books.get(tf)
             builder.seed_from_rates(rows)
-            # Drop the still-forming candle (pos 0 is usually the current bar).
-            if builder.bars:
-                now_u = int(self.clock())
-                tf_sec = builder.tf_seconds
-                builder.bars = [b for b in builder.bars if b.t + tf_sec <= now_u]
             self._log(f"mtf · {tf} backfill {len(builder.bars)} closed bars")
+            self._warn_mtf_history(tf, len(builder.bars))
+
+    def _warn_mtf_history(self, tf: str, n: int) -> None:
+        if n >= _MTF_ATR_HISTORY_NEED:
+            return
+        if tf in self._mtf_hist_warned:
+            return
+        self._mtf_hist_warned.add(tf)
+        self._log(f"mtf · {tf} insufficient history ({n}); strategies will hold")
 
     def _feed_mtf_bar(self, bar) -> None:
         if self.mtf_books is None:
             return
         # One-second book mid as a tick into higher-TF builders.
-        self.mtf_books.on_tick(int(bar.t), float(bar.bid), float(bar.ask))
+        closed = self.mtf_books.on_tick(int(bar.t), float(bar.bid), float(bar.ask))
+        for tf, closed_bar in closed.items():
+            self._reconcile_mtf_close(tf, closed_bar)
+            tf_sec = TF_SECONDS.get(tf, 0)
+            self.entry_window.note_closed_bar(tf, int(closed_bar.t), int(tf_sec))
+
+    def _reconcile_mtf_close(self, tf: str, local_bar: Bar) -> None:
+        """On each higher-TF close, pull MT5's closed bar (pos 1) and let MT5 win."""
+        del local_bar  # identity comes from MT5; local only triggers the reconcile
+        if self.mtf_books is None:
+            return
+        copy_fn = getattr(self.broker, "copy_rates_from_pos", None)
+        tf_enum = TF_ENUM.get(tf)
+        if not callable(copy_fn) or tf_enum is None:
+            return
+        try:
+            rows = copy_fn(self.broker.symbol, tf_enum, 1, 1)
+        except Exception as exc:
+            self._log(f"mtf · {tf} reconcile failed: {redact(str(exc))}")
+            return
+        if not rows:
+            return
+        row = rows[0]
+        mt5_bar = Bar(
+            int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]),
+            tick_vol=float(row[5]) if len(row) > 5 else 0.0,
+            spread_mean=float(row[6]) if len(row) > 6 else 0.0,
+            spread_max=float(row[6]) if len(row) > 6 else 0.0,
+        )
+        builder = self.mtf_books.get(tf)
+        before = builder.mismatches
+        builder.reconcile(mt5_bar)
+        if builder.mismatches > before:
+            self._log(f"mtf · {tf} reconcile mismatch · total={builder.mismatches}")
+        self._warn_mtf_history(tf, len(builder.closed()))
 
     def _mtf_closed(self) -> dict | None:
         if self.mtf_books is None:
             return None
         return {tf: builder.closed() for tf, builder in self.mtf_books.books.items()}
+
+    def _signal_candle_t(self, tf: str, bar_t: int) -> int | None:
+        """Open time of the latest closed signal candle for ``tf``, or ``None``."""
+        if tf == "1s":
+            return int(bar_t)
+        if self.mtf_books is not None and tf in self.mtf_books.books:
+            closed = self.mtf_books.get(tf).closed()
+            if closed:
+                last = closed[-1]
+                tf_sec = TF_SECONDS.get(tf, 0)
+                if tf_sec and is_sunday_stub(int(last.t), int(tf_sec)):
+                    return None
+                return int(last.t)
+        sec = TF_SECONDS.get(tf)
+        if not sec:
+            return int(bar_t)
+        open_t = candle_open(int(bar_t), int(sec))
+        # Forming candle: last closed opens one TF earlier.
+        if int(bar_t) < open_t + sec:
+            closed_open = open_t - sec
+            return int(closed_open) if closed_open >= 0 else None
+        return int(open_t)
+
+    def _enabled_entry_names(self) -> list[str]:
+        return [n for n in self.router.enabled_names() if n in ENTRY_STRATEGIES or n == "pa_structure"]
+
+    def _jev_cache_plan(self, bar_t: int) -> tuple[set[str] | None, dict[str, Response]]:
+        """Return (strategies to ask, cached responses to reuse).
+
+        ``ask`` is ``None`` when every enabled strategy should be considered
+        (no candle filter). Otherwise it is the set that needs a fresh Jev call.
+        """
+        ask: set[str] = set()
+        cached: dict[str, Response] = {}
+        for name in self._enabled_entry_names():
+            tf = signal_tf_for(name)
+            candle_t = self._signal_candle_t(tf, int(bar_t))
+            if candle_t is None:
+                continue
+            key = (name, int(candle_t))
+            hit = self._jev_cache.get(key)
+            if hit is not None:
+                self._log(f"jev cache hit · {name} · candle={candle_t}")
+                cached[name] = hit
+            else:
+                ask.add(name)
+        return ask, cached
+
+    def _jev_cache_store(self, ask_names: set[str], bar_t: int, response: Response) -> None:
+        if response is None:
+            return
+        for name in ask_names:
+            tf = signal_tf_for(name)
+            candle_t = self._signal_candle_t(tf, int(bar_t))
+            if candle_t is None:
+                continue
+            # Store a copy keyed by this strategy's candle; answers may be shared
+            # across strategies in one call, which is fine for reuse.
+            self._jev_cache[(name, int(candle_t))] = Response(
+                model=response.model,
+                answers=dict(response.answers),
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                latency_ms=response.latency_ms,
+                cached=True,
+            )
+            # Keep only the latest candle per strategy (1s keys change every bar).
+            stale = [k for k in self._jev_cache if k[0] == name and k[1] != int(candle_t)]
+            for key in stale:
+                del self._jev_cache[key]
+
+    def _jev_merge_response(
+        self, fresh: Response | None, cached: dict[str, Response],
+    ) -> Response | None:
+        if not cached and fresh is None:
+            return None
+        answers: dict[str, Answer] = {}
+        model = "?"
+        tokens_in = 0
+        tokens_out = 0
+        latency = 0.0
+        for resp in cached.values():
+            answers.update(resp.answers)
+            model = resp.model or model
+        if fresh is not None:
+            answers.update(fresh.answers)
+            model = fresh.model or model
+            tokens_in = fresh.input_tokens
+            tokens_out = fresh.output_tokens
+            latency = fresh.latency_ms
+        return Response(
+            model=model, answers=answers,
+            input_tokens=tokens_in, output_tokens=tokens_out, latency_ms=latency,
+            cached=fresh is None and bool(cached),
+        )
 
     def _one_poll(self) -> None:
         self._check_kill()
@@ -670,10 +900,22 @@ class LiveSession:
 
     def on_bar(self, bar, now: datetime):
         self._check_kill()
+        if self.buffer.rows:
+            gap = int(bar.t) - int(self.buffer.rows[-1].t) - 1
+            if gap > 0:
+                self.entry_window.note_feed_gap(float(gap), float(bar.t))
         self._feed_mtf_bar(bar)
+        # Post-gap recovery for 1s / M1 when higher-TF books are off.
+        self.entry_window.note_closed_bar("1s", int(bar.t), 1)
+        if int(bar.t) % 60 == 0 and int(bar.t) >= 60:
+            self.entry_window.note_closed_bar("M1", int(bar.t) - 60, 60)
         if self.buffer.append(bar):
             self._warm_logged = False
             self._log("feed gap; warmup started again")
+        if should_flatten_weekend(now, self.cfg.hold_over_weekend):
+            if self._has_position():
+                self.flatten("weekend flatten")
+            return None
         if not self.hours.is_open(now):
             if self._has_position():
                 self.flatten("market closed")
@@ -823,12 +1065,28 @@ class LiveSession:
                 allow_short=bool(self.cfg.allow_short),
                 h4_ema_allow_short=bool(self.cfg.h4_ema_allow_short),
                 h1_use_sma50_200=bool(self.cfg.h1_use_sma50_200),
+                hold_overrides=dict(self.cfg.hold_overrides),
             )
-            questions = self.router.collect_questions(ctx, positions=positions)
+            # Jev candle-close cache: ask only when a strategy has a NEW closed
+            # signal candle. Between closes, reuse the cached Response for that
+            # strategy (SL/TP/hold/kill still run every second in _protect).
+            # Cost gates mostly run inside decide after Jev; cheap code
+            # preconditions already skip question collection when no setup.
+            ask_names, cached_by_strategy = self._jev_cache_plan(bar.t)
+            questions = self.router.collect_questions(
+                ctx, positions=positions, only=ask_names if ask_names is not None else None,
+            )
             response = None
             if questions:
+                for name in sorted(ask_names or ()):
+                    tf = signal_tf_for(name)
+                    candle_t = self._signal_candle_t(tf, int(bar.t))
+                    if candle_t is not None:
+                        self._log(f"jev ask · {name} · tf={tf} · candle={candle_t}")
                 sent = self.router.state_for_request(ctx, questions, positions=positions)
                 response = self.jev.system_one(sent, questions)
+                self._jev_cache_store(ask_names or set(), int(bar.t), response)
+            response = self._jev_merge_response(response, cached_by_strategy)
         except JevError as exc:
             # Retries and rate-limit backoff already ran inside the client.
             # A failed call is a hold. It is not stored as a Noul of zero.
@@ -946,6 +1204,21 @@ class LiveSession:
     def _open(self, side: int, decision, bar, now: datetime, *, magic: int, strategy: str) -> str:
         if self.cfg.avoid is not None and self.cfg.avoid.blocks(now):
             return f"blocked: avoid hours {self.cfg.avoid.text} Europe/Berlin"
+        tf = signal_tf_for(strategy)
+        gap_token = self.entry_window.gap_block_token(tf)
+        ok_entry, why_entry = allows_entry(
+            now,
+            hold_over_weekend=self.cfg.hold_over_weekend,
+            last_gap_at=gap_token,
+        )
+        if not ok_entry:
+            return f"blocked: {why_entry}"
+        # Reject Sunday-stub signal bars for higher-TF strategies.
+        if tf != "1s":
+            candle_t = self._signal_candle_t(tf, int(bar.t))
+            tf_sec = TF_SECONDS.get(tf, 0)
+            if candle_t is not None and tf_sec and is_sunday_stub(int(candle_t), int(tf_sec)):
+                return f"blocked: sunday stub candle · tf={tf}"
         if self._tracked(magic).side:
             return f"blocked: {strategy} already has a position · magic={magic}"
         if self._hedge_blocked(side):
@@ -965,7 +1238,7 @@ class LiveSession:
             return f"blocked: {exc}"
         hold = decision.max_hold_seconds
         if hold is None:
-            hold = self.cfg.max_hold_seconds
+            hold = self.cfg.hold_overrides.get(strategy, self.cfg.max_hold_seconds)
         comment = order_comment(strategy)
         self._log(
             f"order · magic={magic} · strategy={strategy} · "
@@ -990,6 +1263,11 @@ class LiveSession:
             tracked.tp = intent.tp
             tracked.hold_seconds = int(hold or 0)
             self.router.note_fill(decision)
+        if not self._swap_logged:
+            self._log_swap()
+        else:
+            # Refresh swap on each open for the dashboard.
+            self._log_swap()
         return (
             format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False)
             + f" retcode={report.retcode} · magic={magic} · strategy={strategy}"

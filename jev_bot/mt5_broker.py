@@ -235,6 +235,19 @@ class MT5Broker:
             tick_value=tick_value,
         )
 
+    def swap_rates(self) -> tuple[float, float] | None:
+        """``(swap_long, swap_short)`` from ``symbol_info``, or ``None`` when absent."""
+        mt5 = self._mt5()
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            return None
+        if not hasattr(info, "swap_long") or not hasattr(info, "swap_short"):
+            return None
+        try:
+            return float(info.swap_long), float(info.swap_short)
+        except (TypeError, ValueError):
+            return None
+
     def ensure_clock(self, now_unix: float | None = None) -> int:
         """Lock the broker-clock offset from the latest quote.
 

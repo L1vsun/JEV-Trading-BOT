@@ -19,6 +19,7 @@ from .mtf_base import (
     atr_or_hold,
     cost_gate,
     entry_signal,
+    hold_override_for,
     hold_seconds_for,
     hold_signal,
     labels_for,
@@ -255,7 +256,10 @@ def _size(ctx: MarketContext, atr: float, side: int, zone_price: float
         return None, why
     tp = tp_from_rr(sl, 2.0)
     max_bars = int(limits.max_bars.get(TF, DEFAULT_MAX_BARS.get(TF, 30)))
-    hold = hold_seconds_for(TF, max_bars, int(getattr(limits, "global_max_hold", 900) or 900))
+    hold = hold_seconds_for(
+        TF, max_bars, int(getattr(limits, "global_max_hold", 900) or 900),
+        override=hold_override_for(NAME, limits=limits, ctx=ctx),
+    )
     return sl, tp, hold
 
 

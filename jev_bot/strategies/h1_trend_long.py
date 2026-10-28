@@ -17,6 +17,7 @@ from .mtf_base import (
     atr_or_hold,
     cost_gate,
     entry_signal,
+    hold_override_for,
     hold_seconds_for,
     hold_signal,
     labels_for,
@@ -203,7 +204,10 @@ def _sl_tp_hold(ctx: MarketContext, atr: float) -> tuple[float, float, int] | tu
     if not ok:
         return None, why
     max_bars = int(limits.max_bars.get(TF, DEFAULT_MAX_BARS.get(TF, 24)))
-    hold = hold_seconds_for(TF, max_bars, int(getattr(limits, "global_max_hold", 900) or 900))
+    hold = hold_seconds_for(
+        TF, max_bars, int(getattr(limits, "global_max_hold", 900) or 900),
+        override=hold_override_for(NAME, limits=limits, ctx=ctx),
+    )
     # No fixed RR target — trail / opposite-cross / T4 manage the exit.
     return sl, 0.0, hold
 

@@ -66,6 +66,8 @@ class MarketContext:
     h1_use_sma50_200: bool = False
     h4_ema_allow_short: bool = False
     asian_box: object | None = None
+    # Per-strategy max hold (seconds); may exceed max_hold_seconds / global.
+    hold_overrides: dict = field(default_factory=dict)
 
 
 def noul(question: str, yes: str, no: str) -> Noul:

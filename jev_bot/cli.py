@@ -111,6 +111,31 @@ def cmd_live(args) -> None:
         sys.exit(f"live: {redact(str(e))}")
 
 
+def _parse_hold_overrides(items: list[str] | None) -> dict[str, int]:
+    """Parse repeated ``--hold-override NAME:SECONDS`` into a dict."""
+    out: dict[str, int] = {}
+    if not items:
+        return out
+    for raw in items:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if ":" not in text:
+            raise RiskError("--hold-override must be NAME:SECONDS")
+        name, secs = text.rsplit(":", 1)
+        name = name.strip()
+        if not name:
+            raise RiskError("--hold-override name is empty")
+        try:
+            value = int(secs.strip())
+        except ValueError as exc:
+            raise RiskError(f"--hold-override seconds must be an int ({text!r})") from exc
+        if value < 0:
+            raise RiskError("--hold-override seconds must be >= 0")
+        out[name] = value
+    return out
+
+
 def _parse_backfill(text: str | None) -> dict[str, int]:
     """Default DEFAULT_BACKFILL, or one int applied to every higher TF."""
     if text is None or str(text).strip() == "":
@@ -219,6 +244,20 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument(
         "--max-hold-seconds", type=int, default=900,
         help="close an open position after this many seconds; 0 disables it",
+    )
+    lv.add_argument(
+        "--hold-over-weekend", action="store_true", default=False,
+        help=(
+            "keep bot positions across the Friday gold close; default flattens "
+            "30 minutes before Friday 16:55 America/New_York"
+        ),
+    )
+    lv.add_argument(
+        "--hold-override", action="append", default=None, metavar="NAME:SECONDS",
+        help=(
+            "per-strategy max hold that may exceed --max-hold-seconds "
+            "(repeatable; e.g. --hold-override m5_ny_orb:14400)"
+        ),
     )
     lv.add_argument(
         "--avoid-hours", default=None,
@@ -337,6 +376,10 @@ def main(argv: list[str] | None = None) -> None:
         # Attach parsed backfill onto args for live_config_from_args.
         try:
             args.backfill = _parse_backfill(getattr(args, "backfill_bars", None))
+        except RiskError as e:
+            sys.exit(f"live: {redact(str(e))}")
+        try:
+            args.hold_overrides = _parse_hold_overrides(getattr(args, "hold_override", None))
         except RiskError as e:
             sys.exit(f"live: {redact(str(e))}")
         if getattr(args, "strategies", None):

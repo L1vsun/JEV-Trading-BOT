@@ -254,39 +254,59 @@ class StrategyRouter:
         self,
         ctx: MarketContext,
         positions: dict[str, int] | None = None,
+        *,
+        only: set[str] | None = None,
     ) -> dict[str, Question]:
-        """Only the strategies whose code precondition is true contribute questions."""
+        """Only the strategies whose code precondition is true contribute questions.
+
+        ``only`` restricts which strategy names may contribute (used by the
+        live Jev candle-close cache). ``None`` means every enabled strategy.
+        Cost gates still run inside ``decide`` after Jev for most MTF modules;
+        cheap code preconditions (setup / avoid / history) already skip the ask.
+        """
+        def _want(name: str) -> bool:
+            return only is None or name in only
+
         qs: dict[str, Question] = {}
         c_cons = self._ctx_for(ctx, "consensus", positions)
-        if self.flags.consensus and consensus.precondition(c_cons):
+        if _want("consensus") and self.flags.consensus and consensus.precondition(c_cons):
             qs.update(consensus.questions(c_cons))
         c_vwap = self._ctx_for(ctx, "vwap_fade", positions)
-        if self.flags.vwap_fade and vwap_fade.precondition(c_vwap):
+        if _want("vwap_fade") and self.flags.vwap_fade and vwap_fade.precondition(c_vwap):
             qs.update(vwap_fade.questions())
         c_orb = self._ctx_for(ctx, "orb_london", positions)
-        if self.flags.orb and orb_london.precondition(
+        if _want("orb_london") and self.flags.orb and orb_london.precondition(
             c_orb, zone_name=self.flags.orb_zone, broken_days=self.orb_broken_days
         ):
             qs.update(orb_london.questions())
         pa_ready = False
         c_rej = self._ctx_for(ctx, "pa_rejection", positions)
-        if self.flags.pa_rejection and pa_rejection.precondition(c_rej, spent=self.spent_setup_ids):
+        if _want("pa_rejection") and self.flags.pa_rejection and pa_rejection.precondition(
+            c_rej, spent=self.spent_setup_ids
+        ):
             pin = pa_rejection.find_setup(c_rej, spent=self.spent_setup_ids)
             if pin is not None:
                 qs.update(pa_rejection.questions_for_side(pin.side))
                 qs.update(pa.liquidity_questions())
                 pa_ready = True
         c_ib = self._ctx_for(ctx, "pa_insidebar", positions)
-        if self.flags.pa_insidebar and pa_insidebar.precondition(c_ib, spent=self.spent_setup_ids):
+        if _want("pa_insidebar") and self.flags.pa_insidebar and pa_insidebar.precondition(
+            c_ib, spent=self.spent_setup_ids
+        ):
             setup = pa_insidebar.find_setup(c_ib, spent=self.spent_setup_ids)
             if setup is not None:
                 qs.update(pa_insidebar.questions_for_side(setup.side))
                 qs.update(pa.liquidity_questions())
                 pa_ready = True
-        if self.flags.pa_structure and pa_ready and pa_structure.precondition(ctx):
+        if (
+            _want("pa_structure")
+            and self.flags.pa_structure
+            and pa_ready
+            and pa_structure.precondition(ctx)
+        ):
             qs.update(pa_structure.questions())
         for name, mod in _MTF_MODULES:
-            if not getattr(self.flags, name):
+            if not _want(name) or not getattr(self.flags, name):
                 continue
             c_mtf = self._ctx_for(ctx, name, positions)
             if self._mtf_precondition(mod)(c_mtf):

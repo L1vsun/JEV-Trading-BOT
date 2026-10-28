@@ -1,7 +1,7 @@
 """Shared helpers for M5–H4 strategies: cost/equity gates, min SL, TypeSafe banding."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..bars import TF_SECONDS, Bar
 from ..indicators import atr14
@@ -24,6 +24,8 @@ class MtfLimits:
     allow_short: bool = False
     global_max_hold: int = 900
     max_spread_points: float = 30.0
+    # Per-strategy hold seconds; may exceed global_max_hold when set via CLI.
+    hold_overrides: dict = field(default_factory=dict)
 
 
 def default_mtf_limits() -> MtfLimits:
@@ -32,6 +34,7 @@ def default_mtf_limits() -> MtfLimits:
         k_sl=dict(DEFAULT_K_SL),
         max_bars=dict(DEFAULT_MAX_BARS),
         max_cost_share=dict(DEFAULT_COST_SHARE),
+        hold_overrides={},
     )
 
 
@@ -117,6 +120,26 @@ def hold_seconds_for(tf: str, max_bars: int, global_hold: int, override: int | N
     if override is not None and override > 0:
         return int(override)
     return clamp_hold(wanted, global_hold if global_hold > 0 else wanted)
+
+
+def hold_override_for(strategy: str, *, limits: MtfLimits | None = None,
+                      ctx=None) -> int | None:
+    """CLI / ctx per-strategy hold override, or ``None`` when unset."""
+    overs: dict = {}
+    if limits is not None:
+        overs.update(getattr(limits, "hold_overrides", None) or {})
+    if ctx is not None:
+        overs.update(getattr(ctx, "hold_overrides", None) or {})
+        lim = getattr(ctx, "mtf_limits", None)
+        if lim is not None:
+            overs.update(getattr(lim, "hold_overrides", None) or {})
+    if strategy not in overs:
+        return None
+    try:
+        value = int(overs[strategy])
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def entry_signal(action: str, strategy: str, reason: str, *, sl_points: float, tp_points: float,

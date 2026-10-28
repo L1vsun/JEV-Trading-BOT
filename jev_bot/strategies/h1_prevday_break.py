@@ -17,6 +17,7 @@ from .mtf_base import (
     atr_or_hold,
     cost_gate,
     entry_signal,
+    hold_override_for,
     hold_seconds_for,
     hold_signal,
     labels_for,
@@ -208,7 +209,10 @@ def _size(ctx: MarketContext, atr: float) -> tuple[float, float, int] | tuple[No
     if not ok:
         return None, why
     tp = tp_from_rr(sl, 2.0)
-    hold = hold_seconds_for(TF, MAX_BARS, int(getattr(limits, "global_max_hold", 900) or 900))
+    hold = hold_seconds_for(
+        TF, MAX_BARS, int(getattr(limits, "global_max_hold", 900) or 900),
+        override=hold_override_for(NAME, limits=limits, ctx=ctx),
+    )
     return sl, tp, hold
 
 

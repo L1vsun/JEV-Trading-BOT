@@ -12,8 +12,10 @@ bot turns those numbers into a plain-language market state, asks Jev atomic
 questions about it in one parallel call, and only trades when the answers are
 confident, agree with each other, and agree with the flow.
 
-This repository is **live-only** on MetaTrader 5. There is no dry-run, paper,
-demo, backtest or simulate CLI path. Orders are always sent when `live` runs.
+This repository is **live-only** on MetaTrader 5. There is no `--shadow`, no
+dry-run / paper / demo / backtest / simulate CLI path, and no test suite in
+this tree (tests come later under a Ludwig order). Orders are always sent when
+`live` runs.
 
 ---
 
@@ -94,10 +96,11 @@ the kill file still run). The failed call is not stored as a Noul of zero.
 
 ## Live trading (MetaTrader 5)
 
-`jev-bot live` always sends orders. There is no `--dry-run` and no `--send`.
-You must pass `--allow-real` and set `MT5_CONFIRM_REAL=YES_TRADE_REAL` for
-**both demo and real** accounts. Enable at least one strategy
-(`--strategies` or a `--sig-*` flag); consensus defaults **off**.
+`jev-bot live` always sends orders. There is no `--dry-run`, no `--shadow`,
+and no `--send`. You must pass `--allow-real` and set
+`MT5_CONFIRM_REAL=YES_TRADE_REAL` for **both demo and real** accounts. Enable
+at least one strategy (`--strategies` or a `--sig-*` flag); consensus defaults
+**off**.
 
 ```bash
 pip install -e ".[mt5]"          # on that Windows machine, next to the terminal
@@ -159,12 +162,19 @@ left alone: exits, stops, the hold limit and the kill file still apply.
 
 ### Strategies
 
-Every strategy defaults **off**. Enable them with `--strategies a,b,c` (comma
-list or groups `m5` / `m15` / `h1` / `h4` / `pullback`) and/or the existing
-`--sig-*` flags. `h4_zone_retest` is not in the `h4` group and must be named
-explicitly. `--allow-short` opens short paths on MTF modules that support them
-(H1/H4 unified pullbacks included). `--h4-ema-allow-short` and
-`--h1-sma50-200` flip those strategy-specific modes.
+Every strategy defaults **off**. Enable with `--strategies a,b,c` (comma list
+or groups `m5` / `m15` / `h1` / `h4` / `pullback`) and/or `--sig-*` flags.
+`h4_zone_retest` is not in the `h4` group — name it explicitly.
+`--allow-short` opens short paths on MTF modules that support them (including
+H1/H4 unified pullbacks). `--h4-ema-allow-short` and `--h1-sma50-200` flip
+those strategy-specific modes.
+
+Each entry strategy uses its own MT5 magic (`--magic` base + offset). Offsets
+live in `jev_bot/strategies/magics.py` (override with `--magic-offset-json`).
+
+MTF setups evaluate **closed** signal-TF candles only. Live asks Jev when a
+ready strategy contributes questions; pass `--cache FILE` to record answers
+and reuse identical request bodies.
 
 | flag / name | role |
 |---|---|
@@ -175,11 +185,57 @@ explicitly. `--allow-short` opens short paths on MTF modules that support them
 | `--sig-pa-rejection` / `pa_rejection` | M5 pin-bar rejection at a zone |
 | `--sig-pa-insidebar` / `pa_insidebar` | M5 inside-bar breakout in mother direction |
 | `--sig-pa-structure` / `pa_structure` | M5 structure filter for PA only (never alone) |
-| `m5` / `m5_ny_orb`, `m5_asianbox`, `m5_vwap_pb` | M5 ORB, Asian box, VWAP pullback |
-| `m15` / `m15_ny_orb`, `m15_asia_squeeze`, `m15_trend_pullback` | M15 setups |
-| `h1` / `h1_trend_long`, `h1_pullback`, `h1_prevday_break` | H1 setups |
-| `h4` / `h4_donchian`, `h4_ema_pullback` | H4 setups (`h4_zone_retest` separate) |
-| `pullback` / `pullback_m1`…`pullback_h4` | unified EMA pullbacks (`--sig-pullback-m1`…`h4`) |
+| `m5_ny_orb` | M5 NY ORB (09:30–10:00 NY); one trade/session; time stop 21:00 UTC |
+| `m5_asianbox` | M5 Asian-box breakout (box 00–07 UTC, trade 07–10 UTC) |
+| `m5_vwap_pb` | M5 session-VWAP pullback continuation (12:30–16:30 UTC) |
+| `m15_ny_orb` | M15 NY ORB (first four M15 after 09:30 NY) |
+| `m15_asia_squeeze` | M15 Asia-range squeeze breakout (18:00–03:00 NY) |
+| `m15_trend_pullback` | legacy alias of unified M15 EMA pullback |
+| `h1_trend_long` | H1 EMA9/20 (or SMA50/200) cross **long only**; gold bull bias |
+| `h1_pullback` | legacy alias of unified H1 EMA pullback |
+| `h1_prevday_break` | H1 first break of prior NY calendar day high/low |
+| `h4_donchian` | H4 Donchian-20 breakout; long-biased when EMA50>EMA200 |
+| `h4_ema_pullback` | legacy alias of unified H4 EMA pullback |
+| `h4_zone_retest` | H4 fractal-zone first retest (experiment; not in `h4` group) |
+| `pullback_m1`…`pullback_h4` | unified EMA pullbacks (`--sig-pullback-m1`…`h4` or group `pullback`) |
+| groups `m5` / `m15` / `h1` / `h4` | enable the three named modules per TF (`h4` omits zone retest) |
+
+#### Mehr-Zeitrahmen / M5–H4
+
+Public Beleglage (not this repo's live log): the
+[fxabsolute XAUUSD study](https://fxabsolute.com/research/xauusd-strategy-backtest)
+(20 setups, 39,947 trades, XAUUSD 2021–2026) reports median cost per R of
+**M5 15.5%**, **M15 10.6%**, **H1 5.5%**, with Pearson correlation to
+expectancy about **−0.861**. After multiple-testing correction, **no strategy
+was significant**. Candle backtests (e.g. fxbacktest.app) systematically
+**overestimate** edge versus tick/cost-aware paths.
+
+All M5–H4 modules here are **experiments, default off**, and **not proven
+profitable after costs** on XAUUSD. Gold's multi-year bull market biases
+trend-following longs (`h1_trend_long`); in those studies buy-and-hold beat
+active rules. Compare any enablement against a random-entry control before
+sizing up.
+
+Intentionally **omitted** (negatively evidenced or unproven for this cost
+regime): EMA 9/21 cross on M5, RSI(2) pullback, Larry Williams breakout,
+ICT/SMC (FVG, order block, CHoCH, BOS, Silver Bullet), range mean-reversion
+with RSI, Engulfing, break-and-retest.
+
+Higher-TF books come from `MultiTFBooks`, backfilled with
+`copy_rates_from_pos` when the broker exposes it. `--backfill-bars` defaults
+to M1:500, M5:500, M15:400, H1:300, H4:300 (one int for every TF, or
+`TF:count` pairs). Empty books → those strategies hold.
+
+Minimum stops default to M5 300 / M15 500 / H1 1000 / H4 2000 points. Override
+with `--min-sl-m5` / `--min-sl-m15` / `--min-sl-h1` / `--min-sl-h4` only if you
+understand the cost. Large H1/H4 stops may fail the **cost gate** or the
+**equity plausibility** check (loss at SL for one new order would exceed
+current account equity). There is no daily-loss budget.
+
+`--hold-over-weekend` keeps bot positions across the gold-session close /
+weekend instead of flattening. `--hold-override NAME:SECONDS` lets a named
+strategy's hold exceed `--max-hold-seconds` (MTF modules already use session
+ends or `max_bars × TF` as explicit overrides when sizing the trade).
 
 #### Unified pullbacks (`pullback_m1`…`pullback_h4`)
 
@@ -192,24 +248,13 @@ structure break or PB4 yes). M1–M15 trade both ways; H1/H4 shorts need
 `--allow-short`. Legacy names `m15_trend_pullback`, `h1_pullback`, and
 `h4_ema_pullback` are thin aliases of the same template.
 
-**Honest note:** classic EMA/impulse pullbacks are often **negative after
-costs** on M5–H1 for XAUUSD-style spreads (see public write-ups in the
-fxabsolute / YuRa vein). The H4 EMA50 pullback variant here is **untested** in
-this repo — treat it as an experiment behind a tight daily-loss cap.
+Classic EMA/impulse pullbacks are often **negative after costs** on M5–H1 for
+XAUUSD-style spreads (same fxabsolute / cost-per-R picture). The H4 EMA50
+variant is **untested** here — treat it as an experiment gated by cost share
+and equity plausibility, not by a daily-loss cap.
 
-Higher-TF strategies read closed candles from `MultiTFBooks`, backfilled via
-`copy_rates_from_pos` when the broker exposes it (`--backfill-bars` defaults
-to M1:500, M5:500, M15:400, H1:300, H4:300). If backfill is unavailable the books stay
-empty and those strategies hold.
-
-There is **no proven edge after costs** for VWAP fade, London ORB, session-dir,
-the price-action rules, or the M5–H4 experiment modules on XAUUSD. Compare
-against a random-entry control before scaling size. **H1/H4 minimum stops are
-large** (defaults 1000 / 2000 points); they are no longer blocked by a daily
-budget, but may still fail the cost gate or the equity plausibility check
-(loss at SL for one new order would exceed current account equity). Override
-floors with `--min-sl-m5` / `--min-sl-m15` / `--min-sl-h1` / `--min-sl-h4` only
-if you understand the cost.
+There is also **no proven edge after costs** for VWAP fade, London ORB,
+session-dir, or the price-action rules on XAUUSD.
 
 ### Limits
 
@@ -218,12 +263,17 @@ if you understand the cost.
 | `--lot-mode` | `equity-scaled` | or `fixed` with `--lot` |
 | `--lot-base` / `--lot-start-equity` / `--lot-factor` | `0.01` / `1000` / `1.5` | equity stage table |
 | `--max-lots` | `0.05` | hard cap on order and position size |
-| `--max-positions` | `1` | no new entry at the cap; closes are still sent |
+| `--max-positions` | `5` | across all bot magics (1 per strategy); closes still sent |
 | `--max-spread` | `30` | skip a new entry when the spread is wider, in points |
 | `--sl-points` | `200` | global M1 stop; `0` leaves it unset |
 | `--tp-points` | `400` | global take-profit; `0` leaves it unset |
+| `--min-sl-m5` / `m15` / `h1` / `h4` | 300 / 500 / 1000 / 2000 | MTF stop floors in points |
 | `--deviation` | `15` | slippage allowance in points |
 | `--max-hold-seconds` | `900` | close after this many seconds; `0` disables |
+| `--hold-override NAME:SECONDS` | off | per-strategy hold above the global cap |
+| `--hold-over-weekend` | off | keep positions across session close / weekend |
+| `--backfill-bars` | M1:500,… | higher-TF history depth (int or `TF:count` pairs) |
+| `--allow-short` | off | short paths on MTF modules that support them |
 | `--avoid-hours` | off | `HH:MM-HH:MM` Europe/Berlin; blocks new entries only |
 | `--hours gold` | on | XAUUSD session on America/New_York; `--hours always` disables |
 | `--allow-real` + `MT5_CONFIRM_REAL` | required | demo and real; no silent send |
@@ -231,8 +281,9 @@ if you understand the cost.
 | a dead terminal, or ~30 s without a tick while open | | close, then stop |
 | Jev API errors | | hold that bar; process stays up |
 
-Closes use the bot's magic number (`--magic`, default `20261027`) on the
-configured symbol. Other positions on the account are left alone.
+Closes use the bot's magic family (`--magic` base, default `20261027`, plus
+per-strategy offsets in `jev_bot/strategies/magics.py`) on the configured
+symbol. Other positions on the account are left alone.
 
 ### Depth, and the signals that go quiet
 
