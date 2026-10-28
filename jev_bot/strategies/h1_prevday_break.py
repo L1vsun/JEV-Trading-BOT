@@ -41,7 +41,7 @@ B2 = "h1_pd_b2"
 B3 = "h1_pd_b3"
 B4 = "h1_pd_b4"
 KEYS = (B1, B2, B3, B4)
-K_SL = 1.5
+K_SL = 2.0  # H1 default ATR multiple; min SL floor is still 1000 pts
 MAX_BARS = 100
 NY = "America/New_York"
 

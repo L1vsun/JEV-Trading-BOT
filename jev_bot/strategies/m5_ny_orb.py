@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from ..typesafe import Question, Response
-from .common import MarketContext, Policy, Signal, clamp_points, noul, reading, require_zone
+from .common import MarketContext, Policy, Signal, noul, reading, require_zone
 from .mtf_base import (
     atr_or_hold,
     cost_gate,
@@ -277,8 +277,7 @@ def _risk(ctx: MarketContext, setup: NyOrbSetup) -> tuple[float, float, int, str
         if not ok:
             return hold_signal(NAME, f"{NAME}: {why}")
     tp_pts = tp_from_rr(sl_pts, RR)
-    sl_pts = clamp_points(sl_pts, ctx.limits.sl_points)
-    tp_pts = clamp_points(tp_pts, ctx.limits.tp_points)
+    # Global --sl-points/--tp-points (200/400) apply only to M1 / 1-s strategies.
     hold = seconds_until(ctx.now, TIME_STOP_UTC_HOUR)
     if hold <= 0:
         return hold_signal(NAME, f"{NAME}: past {TIME_STOP_UTC_HOUR:02d}:00 UTC time stop")

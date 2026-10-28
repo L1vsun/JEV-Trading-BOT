@@ -240,7 +240,7 @@ def _risk(ctx: MarketContext, setup: dict) -> tuple[float, float, int] | Signal:
     atr = float(setup["atr"])
     spread = ctx_spread_points(ctx)
     atr_sl = stop_points(
-        tf=TF, atr=atr, point=point, k_sl=1.0,
+        tf=TF, atr=atr, point=point, k_sl=float(lim.k_sl.get(TF, 1.5)),
         min_sl=float(lim.min_sl_points.get(TF, 500.0)),
         stops_level=ctx_stops_level(ctx), spread_points=spread,
     )

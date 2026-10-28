@@ -9,7 +9,10 @@ from ..typesafe import Response
 from .common import Policy, Signal, band, clamp_hold, noul, reading
 
 # Minimum stop distance in points (1 point = 0.01 USD on XAUUSD).
+# Overridable via --min-sl-m5 / --min-sl-m15 / --min-sl-h1 / --min-sl-h4.
 MIN_SL_POINTS = {"M1": 200.0, "M5": 300.0, "M15": 500.0, "H1": 1000.0, "H4": 2000.0}
+# ATR multiples. H1 trend-following uses 2.5 in h1_trend_long; H4 default 2.5
+# sits in the 2.0–3.0 band. Global --sl-points 200 clamps M1 / 1-s only.
 DEFAULT_K_SL = {"M1": 1.2, "M5": 1.5, "M15": 1.5, "H1": 2.0, "H4": 2.5}
 DEFAULT_MAX_BARS = {"M1": 30, "M5": 24, "M15": 20, "H1": 24, "H4": 30}
 DEFAULT_COST_SHARE = {"M1": 0.10, "M5": 0.10, "M15": 0.10, "H1": 0.07, "H4": 0.05}
@@ -68,7 +71,11 @@ def cost_pts(spread_points: float) -> float:
 
 def stop_points(*, tf: str, atr: float, point: float, k_sl: float, min_sl: float,
                 stops_level: int, spread_points: float) -> float:
-    """max(k_sl*ATR, min_sl, stops_level+spread) in points."""
+    """max(k_sl*ATR, min_sl, stops_level+spread) in points.
+
+    Never clamp the result to the global M1 ``--sl-points`` (200). Higher-TF
+    stops are gated by the cost share and equity-plausibility checks instead.
+    """
     atr_pts = (k_sl * atr) / point if point > 0 else 0.0
     floor = float(min_sl)
     broker = float(stops_level) + float(spread_points)

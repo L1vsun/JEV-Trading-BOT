@@ -13,7 +13,7 @@ from datetime import datetime
 from ..bars import Bar
 from ..indicators import session_vwap
 from ..typesafe import Question, Response
-from .common import MarketContext, Policy, Signal, clamp_points, noul, reading
+from .common import MarketContext, Policy, Signal, noul, reading
 from .mtf_base import (
     atr_or_hold,
     cost_gate,
@@ -444,8 +444,7 @@ def _risk(ctx: MarketContext, setup: VwapPbSetup) -> tuple[float, float, int] | 
         if not ok:
             return hold_signal(NAME, f"{NAME}: {why}")
     tp_pts = tp_from_rr(sl_pts, RR)
-    sl_pts = clamp_points(sl_pts, ctx.limits.sl_points)
-    tp_pts = clamp_points(tp_pts, ctx.limits.tp_points)
+    # Global --sl-points/--tp-points (200/400) apply only to M1 / 1-s strategies.
     hold = seconds_until(ctx.now, WINDOW_END[0], WINDOW_END[1])
     if hold <= 0:
         return hold_signal(NAME, f"{NAME}: past {WINDOW_END[0]:02d}:{WINDOW_END[1]:02d} UTC")

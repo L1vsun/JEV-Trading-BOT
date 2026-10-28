@@ -150,11 +150,17 @@ down to the broker step. Entries wider than `--max-spread` (points, default 30)
 are skipped. Filling mode follows the symbol. `--deviation` (default 15) is
 slippage in points. Buys pay the ask, sells hit the bid.
 
-`--sl-points` / `--tp-points` are the global M1 distances (defaults 200 / 400).
-`0` leaves that side unset. Higher-TF strategies compute their own stops from
-ATR and per-TF minimums, then clamp so they can only be tighter than the global
-limits when those globals are set. Live orders send stop loss and take profit
-on the position. `--max-hold-seconds` defaults to 900; `0` disables it.
+`--sl-points` / `--tp-points` are the global **M1 / 1-s** distances (defaults
+200 / 400). `0` leaves that side unset. They do **not** cap M5–H4 stops.
+Higher-TF strategies set
+`SL = max(k_sl × ATR14(TF), min-SL(TF), stops_level + spread)` with defaults
+`k_sl` M5/M15 1.5, H1 2.0 (trend-long 2.5), H4 2.5 (2.0–3.0 band) and min-SL
+M1 200 / M5 300 / M15 500 / H1 1000 / H4 2000 points (override with
+`--min-sl-*`). TP is usually `2 × SL` (H4 Donchian has no fixed TP; trailing).
+Large H1/H4 stops are gated by the cost share and by equity plausibility
+(loss at SL for one order must not exceed current equity) — for example a
+0.02 lot on a small account can still be held. Live orders send those SL/TP
+prices on the position. `--max-hold-seconds` defaults to 900; `0` disables it.
 
 `--avoid-hours` is off unless you set it. `13:00-17:00` blocks new entries from
 13:00 inclusive to 17:00 exclusive in Europe/Berlin. Positions already open are
@@ -226,11 +232,19 @@ Higher-TF books come from `MultiTFBooks`, backfilled with
 to M1:500, M5:500, M15:400, H1:300, H4:300 (one int for every TF, or
 `TF:count` pairs). Empty books → those strategies hold.
 
-Minimum stops default to M5 300 / M15 500 / H1 1000 / H4 2000 points. Override
-with `--min-sl-m5` / `--min-sl-m15` / `--min-sl-h1` / `--min-sl-h4` only if you
-understand the cost. Large H1/H4 stops may fail the **cost gate** or the
-**equity plausibility** check (loss at SL for one new order would exceed
-current account equity). There is no daily-loss budget.
+| TF | min SL (pts) | default `k_sl` |
+|---|---:|---:|
+| M1 | 200 | 1.2 (pullback / 1-s use global 200) |
+| M5 | 300 | 1.5 |
+| M15 | 500 | 1.5 |
+| H1 | 1000 | 2.0 (`h1_trend_long` 2.5) |
+| H4 | 2000 | 2.5 |
+
+Override floors with `--min-sl-m5` / `--min-sl-m15` / `--min-sl-h1` /
+`--min-sl-h4` only if you understand the cost. The global `--sl-points 200`
+cap is **M1-only**. Large H1/H4 stops may fail the **cost gate** or
+**equity plausibility** (e.g. 0.02 lot when loss-at-SL would exceed equity).
+There is no daily-loss budget.
 
 `--hold-over-weekend` keeps bot positions across the gold-session close /
 weekend instead of flattening. `--hold-override NAME:SECONDS` lets a named
