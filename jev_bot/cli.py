@@ -221,6 +221,16 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--magic", type=int, default=20261027)
     lv.add_argument("--hours", choices=("gold", "always"), default="gold", help="gold follows the New York spot session; always disables the filter")
     lv.add_argument("--levels", type=int, default=5, help="depth levels to keep when the terminal publishes a book")
+    lv.add_argument("--sig-consensus", dest="sig_consensus", action="store_true", default=True,
+                    help="use the 14-Noul consensus truth table (default on)")
+    lv.add_argument("--no-sig-consensus", dest="sig_consensus", action="store_false",
+                    help="turn the consensus strategy off")
+    lv.add_argument("--sig-vwap-fade", dest="sig_vwap_fade", action="store_true", default=False,
+                    help="enable VWAP fade (default off); asks Jev only when z and the cost gate pass")
+    lv.add_argument("--sig-orb", dest="sig_orb", action="store_true", default=False,
+                    help="enable London opening-range breakout (default off)")
+    lv.add_argument("--filter-session-dir", dest="filter_session_dir", action="store_true", default=False,
+                    help="keep only entries that match the first 30 minutes of the gold session (default off)")
     lv.add_argument("-v", "--verbose", action="store_true")
     lv.set_defaults(fn=cmd_live)
     a = sp.add_parser("ask"); a.add_argument("state"); a.set_defaults(fn=cmd_ask)

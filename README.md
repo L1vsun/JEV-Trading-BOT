@@ -218,6 +218,24 @@ Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size
 
 `--avoid-hours` is off unless you set it. `13:00-17:00` blocks new entries from 13:00 inclusive to 17:00 exclusive in Europe/Berlin, which is the London and New York overlap in local time, including daylight saving. A window that passes midnight (`22:00-02:00`) wraps. Positions already open are left alone: Jev can still exit them, and the stop, the hold limit, the daily loss and the kill file still apply. The startup lines print every effective value, including a control that is off.
 
+### Optional M1 strategies
+
+Live can OR several strategy votes. Each strategy that needs Jev has its own Noul questions and its own truth table (yes ≥ 0.7, no ≤ 0.3, the band and a missing answer are hold). Code computes the numbers and the precondition; Jev is asked only when that precondition is true, and several ready strategies share one request. A long/short conflict is hold. The log names the strategy and the feature values. Strategy stops and hold times are clamped so they can only be tighter than the global limits.
+
+| flag | default | role |
+|---|---|---|
+| `--sig-consensus` / `--no-sig-consensus` | on | the 14-Noul consensus table in `jev_bot/questions.py` |
+| `--sig-vwap-fade` | off | session VWAP fade with a cost gate, then one confirmation Noul |
+| `--sig-orb` | off | London opening-range breakout (first 30 minutes from 08:00 `Europe/London`) |
+| `--filter-session-dir` | off | code-only filter: keep entries that match the first 30 minutes of the gold session |
+
+```bash
+jev-bot live --broker mt5 --dry-run --sig-vwap-fade
+jev-bot live --broker mt5 --dry-run --no-sig-consensus --sig-orb
+```
+
+There is **no proven edge after costs** for VWAP fade, the London opening-range breakout, or the session-direction filter on XAUUSD. The research that added them found no reliable advantage once spread and slippage are counted. Run them in dry-run first, and compare against a random-entry control before sending orders. Sweep/ICT, Squeeze/NR7, EMA scalps on M1/M5 and classic Bollinger are intentionally not included.
+
 ### Limits
 
 | control | default | effect |
@@ -231,6 +249,10 @@ Full size defaults to `0.01` lot, the usual minimum on a cent account. Half size
 | `--deviation` | `15` | slippage allowance in points |
 | `--max-hold-seconds` | `900` | close the open position after this many seconds. `0` disables it. The session stays up |
 | `--avoid-hours` | off | `HH:MM-HH:MM` in Europe/Berlin. Blocks new entries only. `13:00-17:00` skips the London/New York overlap |
+| `--sig-consensus` | on | 14-Noul consensus truth table |
+| `--sig-vwap-fade` | off | VWAP fade (Jev only when z and the cost gate pass) |
+| `--sig-orb` | off | London opening-range breakout |
+| `--filter-session-dir` | off | keep only entries aligned with the session's first 30 minutes |
 | `--hours gold` | on | XAUUSD session on the America/New_York clock, with a few minutes of buffer around the daily break. If that time zone cannot be loaded the session stops before it connects. Windows gets the database from the `tzdata` dependency. `--hours always` disables the filter. `--avoid-hours` needs Europe/Berlin the same way, and only when the option is set |
 | `jev.KILL` | `--kill-file` | creating this file closes the bot's positions and stops the process. Ctrl-C does the same |
 | a dead terminal, or ~30 s without a tick while the session is open | | close, then stop |

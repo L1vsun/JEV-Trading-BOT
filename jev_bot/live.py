@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from .decide import Decision, decide
+from .decide import Decision
 from .features import feature_matrix
 from .mt5_feed import MarketBuffer, Tick, TickAggregator, depth_note
 from .quant import FairValueModel
-from .questions import decision_questions, state_for_model
 from .state import StateBuilder
+from .strategies import StrategyFlags, StrategyRouter, build_context
 from .risk import (
     AvoidHours,
     ConnectionLost,
@@ -101,6 +101,7 @@ class LiveConfig:
     max_hold_seconds: int = 900
     avoid: AvoidHours | None = None
     limits: RiskLimits = field(default_factory=RiskLimits)
+    strategies: StrategyFlags = field(default_factory=StrategyFlags)
 
 
 def live_config_from_args(args) -> LiveConfig:
@@ -122,11 +123,19 @@ def live_config_from_args(args) -> LiveConfig:
         raise RiskError("history must cover the warmup")
     if args.hours not in ("gold", "always"):
         raise RiskError("market hours must be 'gold' or 'always'")
+    strategies = StrategyFlags(
+        consensus=bool(getattr(args, "sig_consensus", True)),
+        vwap_fade=bool(getattr(args, "sig_vwap_fade", False)),
+        orb=bool(getattr(args, "sig_orb", False)),
+        session_dir=bool(getattr(args, "filter_session_dir", False)),
+    )
+    if not (strategies.consensus or strategies.vwap_fade or strategies.orb):
+        raise RiskError("enable at least one of --sig-consensus, --sig-vwap-fade, --sig-orb")
     return LiveConfig(
         symbol=args.symbol, step=args.step, warmup=args.warmup, history=args.history,
         levels=args.levels, dry_run=not bool(args.send), allow_real=bool(args.allow_real),
         kill_file=args.kill_file, magic=args.magic, hours=args.hours, verbose=bool(args.verbose),
-        max_hold_seconds=hold, avoid=avoid, limits=limits,
+        max_hold_seconds=hold, avoid=avoid, limits=limits, strategies=strategies,
     )
 
 
@@ -144,13 +153,14 @@ class LiveSession:
         self.clock = clock or time.time
         self.agg = TickAggregator(self.cfg.levels, self.cfg.fallback_size, self.cfg.max_gap)
         self.buffer = MarketBuffer(self.cfg.history, max_gap=self.cfg.max_gap)
-        self.qs = decision_questions()
+        self.router = StrategyRouter(flags=self.cfg.strategies)
         self.position = 0
         self.qty = 0.0
         self.px_in = 0.0
         self.t_in = 0
         self.sl = 0.0
         self.tp = 0.0
+        self.pos_hold_seconds = 0
         self.realized = 0.0
         self.last_msc = 0
         self._contract = 0.0
@@ -219,6 +229,13 @@ class LiveSession:
             f"live · mt5 · {self.broker.symbol} · {mode} · model {describe_model(self.jev)} · "
             f"{self.broker.describe()}"
         )
+        flags = self.cfg.strategies
+        sigs = (
+            f"consensus={'on' if flags.consensus else 'off'} · "
+            f"vwap_fade={'on' if flags.vwap_fade else 'off'} · "
+            f"orb={'on' if flags.orb else 'off'} · "
+            f"session_dir={'on' if flags.session_dir else 'off'}"
+        )
         self._log(
             f"limits · lot {self.limits.lot:g} · max_lots {self.limits.max_lots:g} · "
             f"max_positions {self.limits.max_positions} · max_daily_loss {self.limits.max_daily_loss:g} · "
@@ -228,6 +245,7 @@ class LiveSession:
             f"hours {self.cfg.hours} · step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
             f"contract {spec.contract_size:g} · point {spec.point:g}"
         )
+        self._log(f"strategies · {sigs}")
         if str(getattr(self.jev, "model", "")).startswith("surrogate"):
             if (os.environ.get("TYPESAFE_API_KEY") or "").strip():
                 self._log("WARNING: live is using the offline surrogate, not TypeSafe Jev.")
@@ -362,6 +380,7 @@ class LiveSession:
         self.tp = 0.0
         self.t_in = 0
         self.px_in = 0.0
+        self.pos_hold_seconds = 0
 
     def flatten(self, reason: str) -> None:
         self._log(f"flatten: {reason}")
@@ -418,7 +437,7 @@ class LiveSession:
                 reason, px = hit
                 self._log(self._close(bar, reason, px=px))
                 return True
-        limit = self.cfg.max_hold_seconds
+        limit = self.pos_hold_seconds or self.cfg.max_hold_seconds
         if limit and bar.t - self.t_in >= limit:
             self._log(self._close(bar, f"max hold {limit}s"))
             return True
@@ -439,8 +458,19 @@ class LiveSession:
                 position_text(self.position, bar.t, self.t_in, self.px_in, bar.bid, bar.ask),
             )
             mark_depth(state, self.buffer.depth_live)
-            sent = state_for_model(state)
-            response = self.jev.system_one(sent, self.qs)
+            spec = self.broker.spec()
+            ctx = build_context(
+                now=now, bar_t=bar.t, mid=float(raw["mid"][-1]), bid=bar.bid, ask=bar.ask,
+                point=spec.point, digits=spec.digits, position=self.position, semantic=state,
+                times=[int(x) for x in mkt.t], mids=[float(x) for x in raw["mid"]],
+                buy_vol=[float(x) for x in mkt.buy_vol], sell_vol=[float(x) for x in mkt.sell_vol],
+                limits=self.limits, max_hold_seconds=self.cfg.max_hold_seconds,
+            )
+            questions = self.router.collect_questions(ctx)
+            response = None
+            if questions:
+                sent = self.router.state_for_request(ctx, questions)
+                response = self.jev.system_one(sent, questions)
         except JevError as exc:
             # Retries and rate-limit backoff already ran inside the client.
             # A failed call is a hold. It is not stored as a Noul of zero.
@@ -454,10 +484,13 @@ class LiveSession:
         except Exception as exc:
             self.flatten("session error")
             raise TradingHalted(redact(f"{type(exc).__name__}: {exc}")) from exc
-        if not self._answered:
+        if response is not None and not self._answered:
             self._answered = True
             self._log(f"first answer · model {response.model}")
-        decision = decide(len(self.buffer) - 1, response, self.position)
+        decision = self.router.decide(ctx, response)
+        if decision.action in ("buy", "sell") and decision.strategy:
+            feat = decision.features or {}
+            self._log(f"signal · {decision.strategy} · {decision.action} · {feat}")
         line = self._act(decision, bar, now)
         if line and (self.cfg.verbose or not line.startswith("hold")):
             self._log(line)
@@ -500,13 +533,23 @@ class LiveSession:
         self._clear_stops()
         return f"EXIT{shown} ({reason})"
 
+    def _trade_limits(self, decision) -> RiskLimits:
+        """Global limits, with optional tighter strategy stops for this fill."""
+        lim = self.limits
+        sl = decision.sl_points if decision.sl_points is not None else lim.sl_points
+        tp = decision.tp_points if decision.tp_points is not None else lim.tp_points
+        if sl == lim.sl_points and tp == lim.tp_points:
+            return lim
+        return replace(lim, sl_points=sl, tp_points=tp)
+
     def _open(self, side: int, decision, bar, now: datetime) -> str:
         if self.cfg.avoid is not None and self.cfg.avoid.blocks(now):
             return f"blocked: avoid hours {self.cfg.avoid.text} Europe/Berlin"
         try:
             spec = self.broker.spec()
             self._contract = spec.contract_size or self._contract or 1.0
-            intent = build_order(side, self.limits.lot * decision.size, spec, self.limits)
+            limits = self._trade_limits(decision)
+            intent = build_order(side, self.limits.lot * decision.size, spec, limits)
             if self.cfg.dry_run:
                 count, current = (1 if self.position else 0), 0.0
             else:
@@ -515,6 +558,9 @@ class LiveSession:
             check_entry(self.limits, intent.volume, count, current)
         except RiskError as exc:
             return f"blocked: {exc}"
+        hold = decision.max_hold_seconds
+        if hold is None:
+            hold = self.cfg.max_hold_seconds
         if self.cfg.dry_run:
             self.position = side
             self.qty = intent.volume
@@ -522,6 +568,8 @@ class LiveSession:
             self.t_in = bar.t
             self.sl = intent.sl
             self.tp = intent.tp
+            self.pos_hold_seconds = int(hold or 0)
+            self.router.note_fill(decision)
             return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=True)
         try:
             report = self.broker.send(intent)
@@ -535,6 +583,8 @@ class LiveSession:
             self.t_in = bar.t
             self.sl = intent.sl
             self.tp = intent.tp
+            self.pos_hold_seconds = int(hold or 0)
+            self.router.note_fill(decision)
         return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False) + f" retcode={report.retcode}"
 
     def _log(self, msg: str) -> None:

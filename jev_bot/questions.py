@@ -12,7 +12,7 @@ Noul bands, from the TypeSafe starting point:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .typesafe import Noul, Question, Response
 
@@ -164,10 +164,16 @@ class Decision:
     gates: dict[str, bool]
     reason: str
     answers: dict | None = None
+    strategy: str = ""
+    features: dict = field(default_factory=dict)
+    sl_points: float | None = None
+    tp_points: float | None = None
+    max_hold_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.answers is None:
             self.answers = {}
+
 
 
 def _reading(response: Response, key: str) -> float | None:

@@ -300,9 +300,11 @@ def _cfg(**kw) -> LiveConfig:
             lim[key] = kw.pop(key)
     kill = kw.pop("kill_file", None) or str(Path(tempfile.mkdtemp()) / "jev.KILL")
     # feature_matrix momentum uses a 300-second window, so the first decision needs that much book.
+    from jev_bot.strategies import StrategyFlags
     defaults = dict(
         symbol="XAUUSD", step=1, warmup=320, history=800, hours="always", dry_run=True,
         allow_real=False, kill_file=kill, magic=20261027, verbose=False, max_hold_seconds=0,
+        strategies=StrategyFlags(consensus=True),
     )
     defaults.update(kw)
     defaults["limits"] = RiskLimits(**lim)

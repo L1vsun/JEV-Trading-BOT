@@ -74,6 +74,11 @@ class JevSurrogate:
         else:
             readings["exit_against_long"] = _n(-2)
             readings["exit_against_short"] = _n(-2)
+        # Optional strategy Nouls: lean with the one-minute flow / candle turn.
+        readings["vwap_fade_long"] = _n(2 * f["f60"] + f["c_ret"])
+        readings["vwap_fade_short"] = _n(-2 * f["f60"] - f["c_ret"])
+        readings["orb_break_up"] = _n(2 * f["tape"] + f["f60"])
+        readings["orb_break_down"] = _n(-2 * f["tape"] - f["f60"])
         out: dict[str, Answer] = {}
         for qid, q in questions.items():
             if isinstance(q, Noul):
