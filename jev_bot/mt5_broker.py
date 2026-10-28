@@ -28,10 +28,15 @@ from .risk import (
     RiskError,
     SymbolError,
     SymbolSpec,
+    filling_name,
+    next_filling,
     read_mt5_credentials,
     select_filling,
     trade_mode_name,
 )
+
+# TRADE_RETCODE_INVALID_FILL — broker rejected type_filling.
+_RETCODE_INVALID_FILL = 10030
 
 # RoboForex (and several other MT5 brokers) append one of these to XAUUSD.
 SYMBOL_SUFFIXES: tuple[str, ...] = ("", "c", ".c", "m", ".m", "_i", ".pro", ".ecn", "micro", ".micro")
@@ -416,6 +421,61 @@ class MT5Broker:
                 net -= vol
         return Exposure(net=net, count=len(rows), lots=lots)
 
+    def _done_retcodes(self, mt5) -> set[int]:
+        return {
+            _const(mt5, "TRADE_RETCODE_DONE", _DONE[0]),
+            _const(mt5, "TRADE_RETCODE_DONE_PARTIAL", _DONE[1]),
+            _const(mt5, "TRADE_RETCODE_PLACED", _DONE[2]),
+        }
+
+    def _order_send_with_fill_retry(
+        self,
+        intent: OrderIntent,
+        *,
+        magic: int | None,
+        comment: str,
+        filling_mode: int,
+        position: int | None = None,
+    ) -> OrderReport:
+        """``order_send``; on retcode 10030 retry once with the next allowed fill."""
+        mt5 = self._mt5()
+        done = self._done_retcodes(mt5)
+        used = intent
+        retried = False
+        while True:
+            request = self._request(used, magic=magic, comment=comment)
+            if position is not None:
+                request["position"] = int(position)
+            result = mt5.order_send(request)
+            if result is None:
+                if not self.healthy():
+                    raise ConnectionLost("terminal disconnected")
+                return OrderReport(False, _error_code(mt5), 0.0, 0.0)
+            ret = int(getattr(result, "retcode", 0))
+            price = float(getattr(result, "price", 0) or used.price)
+            volume = float(getattr(result, "volume", 0) or used.volume)
+            if ret in done:
+                if retried:
+                    print(
+                        f"filling retry ok · mode={filling_name(used.filling)} · "
+                        f"retcode={ret}",
+                        flush=True,
+                    )
+                return OrderReport(True, ret, price, volume)
+            invalid = _const(mt5, "TRADE_RETCODE_INVALID_FILL", _RETCODE_INVALID_FILL)
+            if ret == int(invalid) and not retried:
+                alt = next_filling(filling_mode, used.filling)
+                if alt is not None and alt != used.filling:
+                    print(
+                        f"filling rejected retcode={ret} · "
+                        f"retrying {filling_name(used.filling)} → {filling_name(alt)}",
+                        flush=True,
+                    )
+                    used = replace(used, filling=int(alt))
+                    retried = True
+                    continue
+            return OrderReport(False, ret, price, volume)
+
     def send(
         self,
         intent: OrderIntent,
@@ -425,28 +485,20 @@ class MT5Broker:
     ) -> OrderReport:
         if not self.healthy():
             raise ConnectionLost("terminal disconnected")
-        mt5 = self._mt5()
-        request = self._request(intent, magic=magic, comment=comment)
-        result = mt5.order_send(request)
-        if result is None:
-            if not self.healthy():
-                raise ConnectionLost("terminal disconnected")
-            return OrderReport(False, _error_code(mt5), 0.0, 0.0)
-        ret = int(getattr(result, "retcode", 0))
-        done = {
-            _const(mt5, "TRADE_RETCODE_DONE", _DONE[0]),
-            _const(mt5, "TRADE_RETCODE_DONE_PARTIAL", _DONE[1]),
-            _const(mt5, "TRADE_RETCODE_PLACED", _DONE[2]),
-        }
-        price = float(getattr(result, "price", 0) or intent.price)
-        volume = float(getattr(result, "volume", 0) or intent.volume)
-        return OrderReport(ret in done, ret, price, volume)
+        try:
+            filling_mode = int(self.spec().filling_mode)
+        except Exception:
+            filling_mode = 0
+        return self._order_send_with_fill_retry(
+            intent, magic=magic, comment=comment, filling_mode=filling_mode,
+        )
 
     def close_all(self, magic: int | None = None) -> list[OrderReport]:
         """Close bot positions on this symbol. Foreign magics are never touched.
 
         ``magic=None`` closes every magic in ``self.magics``; a concrete value
-        closes only that magic.
+        closes only that magic. Uses the same filling selection / 10030 retry
+        as entries (kill-file flatten, time-stop, strategy exits).
         """
         if not self.healthy():
             raise ConnectionLost("terminal disconnected")
@@ -464,32 +516,25 @@ class MT5Broker:
             side = -1 if buy else 1
             price = float(tick.bid if buy else tick.ask)
             info = mt5.symbol_info(self.symbol)
+            filling_mode = 0
             filling = ORDER_FILLING_RETURN
             digits = 2
             if info is not None:
-                filling = select_filling(int(getattr(info, "filling_mode", 0) or 0),
-                                          int(getattr(info, "trade_exemode", 0) or 0))
+                filling_mode = int(getattr(info, "filling_mode", 0) or 0)
+                filling = select_filling(
+                    filling_mode, int(getattr(info, "trade_exemode", 0) or 0),
+                )
                 digits = int(info.digits)
             pos_magic = int(getattr(pos, "magic", self.magic))
             intent = OrderIntent(
                 side=side, volume=vol, price=round(price, digits), sl=0.0, tp=0.0,
                 deviation=self.deviation, filling=filling, digits=digits, volume_digits=2,
             )
-            request = self._request(intent, magic=pos_magic, comment="jev:close")
-            if hedging:
-                request["position"] = int(getattr(pos, "ticket", 0))
-            result = mt5.order_send(request)
-            if result is None:
-                if not self.healthy():
-                    raise ConnectionLost("terminal disconnected")
-                reports.append(OrderReport(False, _error_code(mt5), 0.0, 0.0))
-                continue
-            ret = int(getattr(result, "retcode", 0))
-            reports.append(OrderReport(ret in _DONE or ret in (
-                _const(mt5, "TRADE_RETCODE_DONE", _DONE[0]),
-                _const(mt5, "TRADE_RETCODE_DONE_PARTIAL", _DONE[1]),
-                _const(mt5, "TRADE_RETCODE_PLACED", _DONE[2]),
-            ), ret, float(getattr(result, "price", 0) or price), vol))
+            ticket = int(getattr(pos, "ticket", 0)) if hedging else None
+            reports.append(self._order_send_with_fill_retry(
+                intent, magic=pos_magic, comment="jev:close",
+                filling_mode=filling_mode, position=ticket,
+            ))
         return reports
 
     def _request(

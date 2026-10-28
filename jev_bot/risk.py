@@ -332,21 +332,55 @@ def normalize_volume(volume: float, vmin: float, vmax: float, step: float) -> fl
     return snapped
 
 
-def select_filling(filling_mode: int, trade_exemode: int) -> int:
+def filling_name(filling: int) -> str:
+    """Human-readable ``type_filling`` label for logs."""
+    return {
+        ORDER_FILLING_FOK: "FOK",
+        ORDER_FILLING_IOC: "IOC",
+        ORDER_FILLING_RETURN: "RETURN",
+    }.get(int(filling), str(filling))
+
+
+def allowed_fillings(filling_mode: int) -> list[int]:
+    """``ORDER_FILLING_*`` values allowed by the symbol bitmask, preferred first.
+
+    Bitmask: FOK=1, IOC=2. RETURN is not a symbol bit — it is only used as a
+    last-resort fallback when the broker advertises neither FOK nor IOC.
+    Preference is independent of ``trade_exemode`` (market / exchange / …).
+    """
+    mode = int(filling_mode)
+    out: list[int] = []
+    if mode & SYMBOL_FILLING_FOK:
+        out.append(ORDER_FILLING_FOK)
+    if mode & SYMBOL_FILLING_IOC:
+        out.append(ORDER_FILLING_IOC)
+    if not out:
+        out.append(ORDER_FILLING_RETURN)
+    return out
+
+
+def select_filling(filling_mode: int, trade_exemode: int = 0) -> int:
     """Pick the ``type_filling`` value ``order_send`` will accept.
 
-    Market and exchange execution use RETURN. Instant and request execution
-    use FOK when the symbol allows it, otherwise IOC, otherwise RETURN.
-    ``filling_mode`` is the symbol bitmask (FOK=1, IOC=2), which is not the
-    same numbering as the order enum.
+    Always prefers FOK then IOC from the symbol ``filling_mode`` bitmask,
+    regardless of ``trade_exemode``. RoboForex XAUUSD (and many market-
+    execution symbols) advertise bitmask 3 (FOK|IOC) and reject RETURN
+    with retcode 10030. ``trade_exemode`` is kept for call-site compatibility.
     """
-    if trade_exemode in (EXEC_MARKET, EXEC_EXCHANGE):
-        return ORDER_FILLING_RETURN
-    if filling_mode & SYMBOL_FILLING_FOK:
-        return ORDER_FILLING_FOK
-    if filling_mode & SYMBOL_FILLING_IOC:
-        return ORDER_FILLING_IOC
-    return ORDER_FILLING_RETURN
+    _ = trade_exemode
+    return allowed_fillings(filling_mode)[0]
+
+
+def next_filling(filling_mode: int, current: int) -> int | None:
+    """Next allowed filling after ``current``, or ``None`` if none remain."""
+    allowed = allowed_fillings(filling_mode)
+    try:
+        idx = allowed.index(int(current))
+    except ValueError:
+        return allowed[0] if allowed else None
+    if idx + 1 >= len(allowed):
+        return None
+    return allowed[idx + 1]
 
 
 @dataclass(frozen=True)
@@ -389,8 +423,7 @@ class OrderIntent:
 
     @property
     def filling_name(self) -> str:
-        return {ORDER_FILLING_FOK: "FOK", ORDER_FILLING_IOC: "IOC", ORDER_FILLING_RETURN: "RETURN"}.get(
-            self.filling, str(self.filling))
+        return filling_name(self.filling)
 
 
 def _round_px(px: float, digits: int) -> float:
