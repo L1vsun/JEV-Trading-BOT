@@ -283,7 +283,21 @@ session-dir, or the price-action rules on XAUUSD.
 
 Closes use the bot's magic family (`--magic` base, default `20261027`, plus
 per-strategy offsets in `jev_bot/strategies/magics.py`) on the configured
-symbol. Other positions on the account are left alone.
+symbol. Other positions on the account are left alone. Override offsets with
+`--magic-offset-json '{"vwap_fade":1}'` when needed.
+
+| strategy | offset | strategy | offset |
+|---|---:|---|---:|
+| `consensus` | 0 | `m15_ny_orb` | 20 |
+| `vwap_fade` | 1 | `m15_asia_squeeze` | 21 |
+| `orb_london` | 2 | `m15_trend_pullback` | 22 |
+| `pa_rejection` | 4 | `h1_trend_long` | 30 |
+| `pa_insidebar` | 5 | `h1_pullback` | 31 |
+| `m5_ny_orb` | 10 | `h1_prevday_break` | 32 |
+| `m5_asianbox` | 11 | `h4_donchian` | 40 |
+| `m5_vwap_pb` | 12 | `h4_ema_pullback` | 41 |
+| `pullback_m1`…`m5` | 50–51 | `h4_zone_retest` | 42 |
+| `pullback_m15`…`h4` | 52–54 | | |
 
 ### Depth, and the signals that go quiet
 
