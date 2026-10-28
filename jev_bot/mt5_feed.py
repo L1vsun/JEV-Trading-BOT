@@ -1,10 +1,10 @@
 """One-second bars from MetaTrader 5 ticks and an optional depth-of-market.
 
-The bars are a :class:`jev_bot.book.Market`, so ``features.py``, ``state.py``
-and ``decide.py`` run on them unchanged. When ``market_book_get`` has no
-depth, each second is a level-1 book with equal placeholder size on both
-sides. That keeps the feature math defined and makes the book signals below
-go quiet instead of inventing a queue.
+The bars are a :class:`jev_bot.book.Market`, so ``features.py`` and
+``state.py`` run on them unchanged. When ``market_book_get`` has no depth,
+each second is a level-1 book with equal placeholder size on both sides.
+That keeps the feature math defined and makes the book signals below go
+quiet instead of inventing a queue.
 
 Degraded without depth (the state field Jev reads is in parentheses):
 

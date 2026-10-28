@@ -199,8 +199,7 @@ TRADE_WINDOWS = (30, 120)
 
 
 def feature_matrix(m: Market) -> tuple[np.ndarray, list[str], dict[str, np.ndarray]]:
-    """All Jev features as a matrix (n, k), their names, and a dict of the raw
-    series that the dashboard and the report use."""
+    """All Jev features as a matrix (n, k), their names, and a dict of raw series."""
     mid = m.mid
     rv = np.maximum(realized_vol(m, 300), m.tick * 0.05)
     depth = np.maximum(rolling_mean(m.bid_sz[:, 0] + m.ask_sz[:, 0], 300), 1.0)

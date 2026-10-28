@@ -1,5 +1,5 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Jev Trading Bot · replay</title>
+<html><head><meta charset="utf-8"><title>Jev Trading Bot · live</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{--bg:#06070a;--panel:#0b0d12;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.14);--ink:#e8ecf3;--dim:#7c8494;--faint:#434a58;
@@ -84,7 +84,7 @@ pre b{color:var(--jev);font-weight:500} pre u{text-decoration:none;color:var(--i
 <div class="pn" style="left:1026px;top:478px;width:240px;height:218px;--pc:var(--dn)">
   <div class="ph">trade log</div><div class="log" id="log"></div>
 </div>
-<div class="foot"><span>api <b>POST /v1/systemone</b></span><span>model <b id="fM">jev-latest</b></span><span>question types <b>choice · score · noul</b></span><span class="r" id="fR">paper trading · not financial advice</span></div>
+<div class="foot"><span>api <b>POST /v1/systemone</b></span><span>model <b id="fM">jev-latest</b></span><span>question types <b>choice · score · noul</b></span><span class="r" id="fR">live MT5 · not financial advice</span></div>
 </div>
 <script>
 const D=/*__DATA__*/null;
@@ -99,7 +99,7 @@ function cv(id,w,h){const c=$(id); c.width=w*2; c.height=h*2; c.style.width=w+"p
 const gP=cv("cP",758,344), gB=cv("cB",242,222);
 const clock=s=>{s=Math.floor(s); return [s/3600|0,(s/60|0)%60,s%60].map(x=>String(x).padStart(2,"0")).join(":");};
 const usd=v=>(v<0?"-$":"$")+Math.abs(v).toFixed(2);
-$("live").textContent=D.model; $("fM").textContent=D.model; if(D.surrogate) $("fR").textContent="offline surrogate answers · paper trading · not financial advice";
+$("live").textContent=D.model; $("fM").textContent=D.model; $("fR").textContent="live MT5 · not financial advice";
 // ------------------------------------------------ question rows
 const COL={buy:"#3ee08f",sell:"#ff5470",hold:"#5b6272",up:"#3ee08f",down:"#ff5470",neutral:"#5b6272",unclear:"#5b6272",
   buyers:"#3ee08f",sellers:"#ff5470",neither:"#5b6272",trending_up:"#3ee08f",trending_down:"#ff5470",ranging:"#5b6272",disorderly:"#ffb13d"};

@@ -12,8 +12,8 @@ distribution + confidence). All questions in one call are evaluated in
 parallel, so the bot asks everything it needs in a single request.
 
 Also here: retries with exponential backoff on 429/529 (honouring
-``retry-after``), token/cost accounting, ``GET /v1/models``, and a JSONL
-response cache so a live run can be replayed later without a key.
+``retry-after``), token/cost accounting, ``GET /v1/models``, and an optional
+JSONL response cache for ``ask`` / live recording (not a trading simulator).
 """
 from __future__ import annotations
 
@@ -117,8 +117,7 @@ class Response:
 
 
 class SystemOne(Protocol):
-    """Anything that answers typed questions about a state: the real Jev
-    client or a replay cache."""
+    """Anything that answers typed questions about a state (the real Jev client)."""
     model: str
 
     def system_one(self, state: Any, questions: dict[str, Question]) -> Response: ...
@@ -196,7 +195,7 @@ class JevClient:
         if not self.api_key and not cache_only:
             raise JevError(
                 "TYPESAFE_API_KEY is not set. Export it before calling ask, models, or live "
-                "(or pass --replay-cache FILE for offline replay)."
+                "(ask may use --replay-cache FILE to answer from a recorded JSONL cache only)."
             )
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:

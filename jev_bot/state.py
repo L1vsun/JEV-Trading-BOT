@@ -15,8 +15,7 @@ import numpy as np
 
 from .features import rolling_std
 
-# Ordered vocabularies, strongest-negative -> strongest-positive. The
-# surrogate model inverts these, so it only ever sees what Jev sees.
+# Ordered vocabularies, strongest-negative -> strongest-positive.
 FLOW = ["heavy selling", "moderate selling", "light selling", "balanced", "light buying", "moderate buying", "heavy buying"]
 PRICE = ["falling fast", "falling steadily", "drifting lower", "flat", "drifting higher", "rising steadily", "rising fast"]
 BOOK = ["ask queue much thicker than the bid", "ask queue thicker than the bid", "roughly even queues",

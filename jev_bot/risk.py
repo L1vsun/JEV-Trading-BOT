@@ -87,16 +87,12 @@ def trade_mode_name(mode: int) -> str:
     return {0: "demo", 1: "contest", 2: "real"}.get(int(mode), "real")
 
 
-def assert_may_send(trade_mode: str, *, dry_run: bool, allow_real: bool, confirm: str | None) -> None:
+def assert_may_send(trade_mode: str, *, allow_real: bool, confirm: str | None) -> None:
     """Refuse to send orders unless ``--allow-real`` and the confirm phrase match.
 
     Live-only: demo, contest and real accounts all require both the flag and
-    :data:`CONFIRM_PHRASE`. ``dry_run`` is kept for call-site compatibility;
-    the live loop always passes ``dry_run=False``. A true ``dry_run`` still
-    returns without sending, but no CLI path sets it.
+    :data:`CONFIRM_PHRASE`. There is no dry-run escape hatch.
     """
-    if dry_run:
-        return
     _ = trade_mode  # demo and real are gated the same way
     if allow_real and confirm == CONFIRM_PHRASE:
         return
@@ -459,15 +455,14 @@ def build_order(side: int, volume: float, spec: SymbolSpec, limits: RiskLimits) 
     )
 
 
-def format_intent(symbol: str, intent: OrderIntent, spread_points: float, *, dry_run: bool) -> str:
+def format_intent(symbol: str, intent: OrderIntent, spread_points: float) -> str:
     side = "BUY" if intent.side > 0 else "SELL"
-    head = "DRY-RUN " if dry_run else ""
     vd, pd = intent.volume_digits, intent.digits
     sl = f"{intent.sl:.{pd}f}" if intent.sl else "off"
     tp = f"{intent.tp:.{pd}f}" if intent.tp else "off"
     note = " stops widened to the broker minimum" if intent.stops_adjusted else ""
     return (
-        f"{head}{side} {symbol} {intent.volume:.{vd}f} @ {intent.price:.{pd}f} "
+        f"{side} {symbol} {intent.volume:.{vd}f} @ {intent.price:.{pd}f} "
         f"sl={sl} tp={tp} deviation={intent.deviation}pts filling={intent.filling_name} "
         f"spread={spread_points:.0f}pts{note}"
     )
@@ -626,7 +621,7 @@ class MarketHours:
 
 
 def position_text(side: int, t: int, t_in: int, px_in: float, bid: float, ask: float) -> str:
-    """Same wording as the paper loop, so Jev sees a familiar ``position`` field."""
+    """Plain-language ``position`` field for Jev state."""
     if not side:
         return "flat"
     held = max(0, t - t_in)

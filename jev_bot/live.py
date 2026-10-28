@@ -459,7 +459,7 @@ class LiveSession:
         if not 1 <= self.cfg.levels <= 10:
             raise RiskError("levels must be between 1 and 10")
         assert_may_send(
-            self.broker.trade_mode(), dry_run=False, allow_real=True,
+            self.broker.trade_mode(), allow_real=True,
             confirm=os.environ.get("MT5_CONFIRM_REAL"),
         )
         from .mt5_broker import require_algo_trading
@@ -1276,7 +1276,7 @@ class LiveSession:
             # Refresh swap on each open for the dashboard.
             self._log_swap()
         return (
-            format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False)
+            format_intent(self.broker.symbol, intent, spec.spread_points)
             + f" retcode={report.retcode} · magic={magic} · strategy={strategy}"
         )
 
