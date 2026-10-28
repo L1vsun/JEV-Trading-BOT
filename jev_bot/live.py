@@ -305,7 +305,8 @@ def live_config_from_args(args) -> LiveConfig:
         raise RiskError(
             "enable at least one entry strategy via --strategies or "
             "--sig-consensus / --sig-vwap-fade / --sig-orb / "
-            "--sig-pa-rejection / --sig-pa-insidebar / an MTF name"
+            "--sig-pa-rejection / --sig-pa-insidebar / "
+            "--sig-pullback-m1…h4 / an MTF name"
         )
 
     hold_overrides = dict(getattr(args, "hold_overrides", None) or {})

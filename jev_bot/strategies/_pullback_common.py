@@ -83,41 +83,58 @@ def all_question_ids(cfg: PullbackConfig) -> tuple[str, ...]:
 
 
 def questions_for(cfg: PullbackConfig) -> dict[str, Question]:
+    """PB1–PB5 mirrored for long and short (Ludwig wording, English for Jev).
+
+    Entry: PB1–PB3 yes (≥0.7), PB4–PB5 no (≤0.3); mid / missing / error → hold.
+    Exit: code SL/TP/time stop, plus PB4 yes as a veto exit.
+    """
     name = cfg.name
     tag = cfg.tf
     out: dict[str, Question] = {}
     for side, label in ((1, "long"), (-1, "short")):
         pb1, pb2, pb3, pb4, pb5 = key_ids(cfg, side)
-        struct = "HH/HL" if side > 0 else "LH/LL"
+        if side > 0:
+            struct = "higher highs and higher lows"
+            impulse = "sell-off"
+            swing_break = (
+                f"Has the pullback in `{name}.pullback` broken a prior swing low "
+                f"to the downside (structure broken) against the long?"
+            )
+        else:
+            struct = "lower highs and lower lows"
+            impulse = "buy-up"
+            swing_break = (
+                f"Has the pullback in `{name}.pullback` broken a prior swing high "
+                f"to the upside (structure broken) against the short?"
+            )
         out[pb1] = noul(
-            f"Does higher-TF / regime structure in `{name}.trend` show {struct} "
-            f"aligned with the proposed {label} on {tag}?",
-            f"Structure confirms the {label} trend.",
-            f"Structure does not confirm the {label} trend.",
+            f"Does the higher-timeframe course in `{name}.trend` show {struct} "
+            f"for the proposed {label} on {tag}?",
+            f"Yes — the higher course shows {struct}.",
+            f"No — the higher course does not show {struct}.",
         )
         out[pb2] = noul(
-            f"Is the {tag} pullback into the EMA in `{name}.pullback` orderly "
-            f"(weaker than the prior impulse, roughly a 38–62% retracement)?",
-            "The pullback looks orderly versus the prior impulse.",
-            "The pullback is chaotic, too deep, or too shallow.",
+            f"Was the {tag} pullback into the EMA in `{name}.pullback` orderly, "
+            f"with shrinking bodies and no impulsive {impulse}?",
+            "Yes — the pullback was orderly with shrinking bodies.",
+            f"No — the pullback was impulsive or chaotic ({impulse}).",
         )
         out[pb3] = noul(
             f"Is the last closed {tag} candle in `{name}.continuation` a clear "
-            f"continuation beyond the pullback extreme for the {label}?",
-            "Clear continuation candle beyond the pullback extreme.",
-            "No clear continuation beyond the pullback extreme.",
+            f"continuation or rejection candle in the {label} trend direction?",
+            f"Yes — a clear continuation/rejection candle for the {label}.",
+            "No — the last closed candle is not a clear continuation/rejection.",
         )
         out[pb4] = noul(
-            f"Has the trend structure already been broken against the {label} setup "
-            f"in `{name}`?",
-            "Structure is broken against the setup.",
-            "Structure is intact for the setup.",
+            swing_break,
+            "Yes — prior swing structure is broken against the setup.",
+            "No — prior swing structure is intact for the setup.",
         )
         out[pb5] = noul(
-            f"Is the {tag} tape in `{name}.tape` too news-driven or chaotic for a "
-            f"{label} pullback entry?",
-            "Conditions are too news-driven or chaotic.",
-            "Conditions are calm enough for a pullback entry.",
+            f"Does the {tag} tape in `{name}.tape` look news-driven and chaotic "
+            f"right now for a {label} pullback?",
+            "Yes — conditions look news-driven or chaotic.",
+            "No — conditions look calm enough for a pullback entry.",
         )
     return out
 

@@ -215,6 +215,7 @@ and reuse identical request bodies.
 | `--sig-pa-rejection` / `pa_rejection` | M5 pin-bar rejection at a zone |
 | `--sig-pa-insidebar` / `pa_insidebar` | M5 inside-bar breakout in mother direction |
 | `--sig-pa-structure` / `pa_structure` | M5 structure filter for PA only (never alone) |
+| `--sig-pullback-m1`…`h4` / `pullback_*` | unified EMA pullbacks (group `pullback`) |
 | `m5_ny_orb` | M5 NY ORB (09:30–10:00 NY); one trade/session; time stop 21:00 UTC |
 | `m5_asianbox` | M5 Asian-box breakout (box 00–07 UTC, trade 07–10 UTC) |
 | `m5_vwap_pb` | M5 session-VWAP pullback continuation (12:30–16:30 UTC) |
@@ -277,19 +278,34 @@ ends or `max_bars × TF` as explicit overrides when sizing the trade).
 
 #### Unified pullbacks (`pullback_m1`…`pullback_h4`)
 
-Shared logic in `jev_bot/strategies/_pullback_common.py`: higher-TF EMA trend
-filter, EMA20 (EMA50 on H4) touch ±0.25 ATR with a flat 38–62% impulse
-retracement, continuation close, ADX14≥20 or efficiency ratio≥0.3, SL
-`max(1.2×ATR beyond extreme, min SL)`, TP 2R, and TF time stops. Jev keys are
-`pb_{tf}_pb1`…`pb5` long/short (entry PB1–3 yes, PB4–5 no; exit on code
-structure break or PB4 yes). M1–M15 trade both ways; H1/H4 shorts need
-`--allow-short`. Legacy names `m15_trend_pullback`, `h1_pullback`, and
-`h4_ema_pullback` are thin aliases of the same template.
+Shared logic in `jev_bot/strategies/_pullback_common.py` (one module per TF:
+`pullback_m1.py` … `pullback_h4.py`). Enable with `--sig-pullback-m1` …
+`--sig-pullback-h4` or `--strategies pullback` / `pullback_m5` (all default
+**off**). Legacy names `m15_trend_pullback`, `h1_pullback`, and
+`h4_ema_pullback` are thin aliases of the same template (kept so the `m15` /
+`h1` / `h4` groups still work).
 
-Classic EMA/impulse pullbacks are often **negative after costs** on M5–H1 for
-XAUUSD-style spreads (same fxabsolute / cost-per-R picture). The H4 EMA50
-variant is **untested** here — treat it as an experiment gated by cost share
-and equity plausibility only (no daily-loss / Tagesbudget stop).
+| TF | higher trend (code) | pullback EMA | max bars | min SL |
+|---|---|---:|---:|---:|
+| M1 | M5 EMA50 slope | 20 | 30 | 200 |
+| M5 | M15 EMA50 slope | 20 | 24 | 300 |
+| M15 | H1 EMA50 slope | 20 | 16 | 500 |
+| H1 | H4 EMA50/EMA200 | 20 | 24 | 1000 |
+| H4 | self EMA50>EMA200 + close>EMA200 | 50 | 30 | 2000 |
+
+Code also requires a ±0.25 ATR EMA touch, 38–62% impulse retracement,
+continuation close beyond the pullback extreme, and ADX14≥20 or efficiency
+ratio≥0.3. SL = `max(1.2×ATR beyond extreme, min SL)`; TP = 2×SL; cost /
+spread / equity-plausibility gates as elsewhere. Jev asks only on that TF's
+candle close. Keys `pb_{tf}_pb1`…`pb5` long/short: entry when PB1–3 yes
+(≥0.7) and PB4–5 no (≤0.3); mid/missing/error → hold. Exit is code
+(SL/TP/time) plus PB4 yes. M1–M15 trade both ways; H1/H4 shorts need
+`--allow-short` (default off). Each TF has its own magic (offsets 50–54).
+
+**Beleglage:** Classic EMA/impulse pullbacks are often **negative after
+costs** on M5–H1 for XAUUSD-style spreads (fxabsolute / YuRa-style
+cost-per-R). The H4 EMA50 variant is **untested** here — treat it as an
+experiment gated by cost share and equity plausibility only.
 
 There is also **no proven edge after costs** for VWAP fade, London ORB,
 session-dir, or the price-action rules on XAUUSD.
