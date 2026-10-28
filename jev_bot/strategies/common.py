@@ -18,7 +18,7 @@ __all__ = [
 
 @dataclass
 class Signal:
-    """One strategy's vote. The router ORs these and holds on a conflict."""
+    """One strategy's vote. Live keeps each buy/sell/exit via ``decide_all``."""
 
     action: str
     reason: str
@@ -54,6 +54,18 @@ class MarketContext:
     max_hold_seconds: int
     minutes: list  # MinuteBar objects
     avoid: object | None = None  # AvoidHours | None; optional entry-hour block
+    mtf: dict | None = None
+    mtf_limits: object | None = None  # MtfLimits | None
+    stops_level: int = 0
+    spread_points: float | None = None
+    lot: float = 0.01
+    equity: float | None = None
+    tick_value: float = 1.0
+    tick_size: float = 0.01
+    allow_short: bool = False
+    h1_use_sma50_200: bool = False
+    h4_ema_allow_short: bool = False
+    asian_box: object | None = None
 
 
 def noul(question: str, yes: str, no: str) -> Noul:

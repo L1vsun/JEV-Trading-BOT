@@ -1,10 +1,9 @@
 """Hard limits for a live broker session.
 
-The default is to log orders and send nothing. A demo or contest account may
-send orders only with an explicit ``--send``. A real-money account, including
-a cent account, also needs ``--allow-real`` and the environment variable
-``MT5_CONFIRM_REAL`` set to :data:`CONFIRM_PHRASE`. Login, password and server
-never pass through these messages.
+Live always sends orders. Demo, contest and real-money accounts (including
+cent accounts) all require ``--allow-real`` and the environment variable
+``MT5_CONFIRM_REAL`` set to :data:`CONFIRM_PHRASE`. There is no silent demo
+path. Login, password and server never pass through these messages.
 """
 from __future__ import annotations
 
@@ -89,29 +88,28 @@ def trade_mode_name(mode: int) -> str:
 
 
 def assert_may_send(trade_mode: str, *, dry_run: bool, allow_real: bool, confirm: str | None) -> None:
-    """Refuse to send orders unless the account and the flags agree.
+    """Refuse to send orders unless ``--allow-real`` and the confirm phrase match.
 
-    Dry-run always passes. Demo and contest accounts pass when the caller has
-    already chosen to send. Real-money accounts pass only with both the flag
-    and the confirmation phrase.
+    Live-only: demo, contest and real accounts all require both the flag and
+    :data:`CONFIRM_PHRASE`. ``dry_run`` is kept for call-site compatibility;
+    the live loop always passes ``dry_run=False``. A true ``dry_run`` still
+    returns without sending, but no CLI path sets it.
     """
     if dry_run:
         return
-    if trade_mode in ("demo", "contest"):
-        return
+    _ = trade_mode  # demo and real are gated the same way
     if allow_real and confirm == CONFIRM_PHRASE:
         return
     raise RiskError(
-        "refusing to send orders on a real-money account; "
-        "pass --allow-real and set MT5_CONFIRM_REAL to the confirmation phrase"
+        "refusing to send orders; pass --allow-real and set MT5_CONFIRM_REAL "
+        "to the confirmation phrase (required for demo and real accounts)"
     )
 
 
 @dataclass(frozen=True)
 class RiskLimits:
     max_lots: float = 0.05
-    max_positions: int = 1
-    max_daily_loss: float = 20.0          # account currency (USC on a cent account)
+    max_positions: int = 5                # across all bot magics; 1 per strategy
     max_spread_points: float = 30.0
     lot: float = 0.01                      # full-size order; half size is lot/2
     sl_points: float = 200.0               # 0 = no stop
@@ -123,8 +121,6 @@ class RiskLimits:
             raise RiskError("max_lots must be positive")
         if self.max_positions < 0:
             raise RiskError("max_positions must be >= 0")
-        if self.max_daily_loss <= 0:
-            raise RiskError("max_daily_loss must be positive")
         if self.lot <= 0:
             raise RiskError("lot must be positive")
         if self.lot > self.max_lots + 1e-12:
@@ -137,11 +133,173 @@ class RiskLimits:
             raise RiskError("max_spread_points must be positive")
 
 
-def loss_breached(pnl: float, limit: float) -> bool:
-    return pnl <= -abs(limit)
+# Equity-scaled lot sizing defaults (CLI: --lot-mode / --lot-base / …).
+LOT_MODE_FIXED = "fixed"
+LOT_MODE_EQUITY_SCALED = "equity-scaled"
+DEFAULT_LOT_MODE = LOT_MODE_EQUITY_SCALED
+DEFAULT_LOT_BASE = 0.01
+DEFAULT_LOT_START_EQUITY = 1000.0
+DEFAULT_LOT_FACTOR = 1.5
+
+
+@dataclass(frozen=True)
+class LotScaling:
+    """Parameters for fixed or equity-scaled order volume.
+
+    ``mode`` is ``fixed`` (use :attr:`RiskLimits.lot`) or ``equity-scaled``
+    (see :func:`scaled_lot`). Staging is independent of ``RiskLimits``; the
+    result is still capped by ``max_lots``.
+    """
+
+    mode: str = DEFAULT_LOT_MODE
+    base: float = DEFAULT_LOT_BASE
+    start_equity: float = DEFAULT_LOT_START_EQUITY
+    factor: float = DEFAULT_LOT_FACTOR
+
+    def validate(self) -> None:
+        if self.mode not in (LOT_MODE_FIXED, LOT_MODE_EQUITY_SCALED):
+            raise RiskError("lot mode must be 'fixed' or 'equity-scaled'")
+        if self.base <= 0:
+            raise RiskError("lot base must be positive")
+        if self.start_equity <= 0:
+            raise RiskError("lot start equity must be positive")
+        if self.factor <= 1.0:
+            raise RiskError("lot factor must be greater than 1")
+
+
+def _equity_readable(equity: float | None) -> bool:
+    if equity is None:
+        return False
+    try:
+        value = float(equity)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value)
+
+
+def equity_lot_stage(
+    equity: float,
+    base: float = DEFAULT_LOT_BASE,
+    start: float = DEFAULT_LOT_START_EQUITY,
+    factor: float = DEFAULT_LOT_FACTOR,
+) -> int:
+    """Return stage index ``n`` for ``equity``.
+
+    Stage ``n`` begins at ``start * factor**n``. Equity below ``start`` (or
+    unreadable) is stage ``0``, which uses the base lot. ``base`` is accepted
+    for a stable call signature with :func:`scaled_lot`; staging itself depends
+    only on equity, start and factor.
+    """
+    _ = base  # kept for call-signature parity with scaled_lot / CLI flags
+    if not _equity_readable(equity) or float(equity) < start:
+        return 0
+    # Largest n with start * factor**n <= equity (avoid log for float edges).
+    n = 0
+    equity_f = float(equity)
+    while start * (factor ** (n + 1)) <= equity_f + 1e-12:
+        n += 1
+        if n > 10_000:
+            break
+    return n
+
+
+def _floor_volume_to_step(volume: float, step: float) -> float:
+    """Always floor ``volume`` onto the broker step grid (from zero)."""
+    if step <= 0:
+        raise RiskError("volume_step must be positive")
+    steps = math.floor(volume / step + 1e-12)
+    return round(steps * step, _decimals(step))
+
+
+def scaled_lot(
+    equity: float | None,
+    *,
+    base: float = DEFAULT_LOT_BASE,
+    start: float = DEFAULT_LOT_START_EQUITY,
+    factor: float = DEFAULT_LOT_FACTOR,
+    volume_min: float = 0.01,
+    volume_step: float = 0.01,
+    max_lots: float = 0.05,
+) -> float:
+    """Equity-scaled lot, floored to ``volume_step`` and capped by ``max_lots``.
+
+    While equity is below ``start``, the lot is ``base``. At stage ``n``
+    (equity ``>= start * factor**n``) the raw lot is ``base * factor**n``, then
+    floored to ``volume_step``, raised to at least ``volume_min``, and capped
+    at ``max_lots``. If equity is ``None`` or unreadable, return ``volume_min``
+    (never a larger speculative size).
+    """
+    if volume_min <= 0 or volume_step <= 0:
+        raise RiskError("volume_min and volume_step must be positive")
+    if max_lots <= 0:
+        raise RiskError("max_lots must be positive")
+    if not _equity_readable(equity):
+        return float(volume_min)
+    equity_f = float(equity)
+    if equity_f < start:
+        raw = float(base)
+    else:
+        n = equity_lot_stage(equity_f, base, start, factor)
+        raw = float(base) * (float(factor) ** n)
+    floored = _floor_volume_to_step(raw, volume_step)
+    if floored < volume_min - 1e-12:
+        floored = float(volume_min)
+    return float(min(floored, max_lots))
+
+
+def lot_stage_table(
+    max_equity: float = 20_000.0,
+    *,
+    base: float = DEFAULT_LOT_BASE,
+    start: float = DEFAULT_LOT_START_EQUITY,
+    factor: float = DEFAULT_LOT_FACTOR,
+    volume_min: float = 0.01,
+    volume_step: float = 0.01,
+    max_lots: float = 0.05,
+) -> list[dict[str, float | int]]:
+    """Rows of ``{stage, equity_from, raw_lot, lot}`` up to ``max_equity``.
+
+    Useful for README examples and session logs. Includes stage ``0`` at
+    ``start`` and every higher stage whose threshold is ``<= max_equity``.
+    """
+    if max_equity < 0:
+        raise RiskError("max_equity must be >= 0")
+    rows: list[dict[str, float | int]] = []
+    n = 0
+    while n <= 10_000:
+        equity_from = float(start) * (float(factor) ** n)
+        if n > 0 and equity_from > max_equity + 1e-12:
+            break
+        raw_lot = float(base) * (float(factor) ** n)
+        lot = scaled_lot(
+            equity_from,
+            base=base,
+            start=start,
+            factor=factor,
+            volume_min=volume_min,
+            volume_step=volume_step,
+            max_lots=max_lots,
+        )
+        rows.append(
+            {
+                "stage": n,
+                "equity_from": equity_from,
+                "raw_lot": raw_lot,
+                "lot": lot,
+            }
+        )
+        if equity_from >= max_equity - 1e-12:
+            break
+        n += 1
+    return rows
 
 
 def check_entry(limits: RiskLimits, volume: float, open_positions: int, current_lots: float) -> None:
+    """Gate a new entry against global position count and total open lots.
+
+    ``current_lots`` is the sum of abs lots across all bot magics; ``volume``
+    is the new order. Together they must stay at or under ``max_lots``.
+    """
     if open_positions >= limits.max_positions:
         raise RiskError("max open positions reached")
     if volume > limits.max_lots + 1e-12:
@@ -211,6 +369,7 @@ class SymbolSpec:
     symbol_trade_mode: int = SYMBOL_TRADE_FULL
     contract_size: float = 100.0
     tick_size: float = 0.01
+    tick_value: float = 1.0
 
     @property
     def spread_points(self) -> float:

@@ -169,6 +169,7 @@ class Decision:
     sl_points: float | None = None
     tp_points: float | None = None
     max_hold_seconds: int | None = None
+    magic: int | None = None     # per-strategy MT5 magic; set by the router
 
     def __post_init__(self) -> None:
         if self.answers is None:
@@ -208,11 +209,23 @@ def composite_trace(labels: dict[str, str]) -> float:
     return score / len(BUY_SIDE)
 
 
+def required_question_ids(position: int) -> tuple[str, ...]:
+    """IDs that must be answered for this position. Exit Nouls only when not flat."""
+    base = BUY_SIDE + SELL_SIDE + VETOES
+    if position > 0:
+        return base + (EXIT_LONG,)
+    if position < 0:
+        return base + (EXIT_SHORT,)
+    return base
+
+
 def decide(t: int, response: Response, position: int, policy: Policy | None = None) -> Decision:
     """Every band combination has a row. The action is never read off confidence."""
     policy = policy or Policy()
-    labels = {key: _band(_reading(response, key), policy) for key in QUESTION_IDS}
+    needed = required_question_ids(position)
+    labels = {key: _band(_reading(response, key), policy) for key in needed}
     answers = {key: answer.to_json() for key, answer in response.answers.items()}
+    # Trace uses buy/sell side labels only (always in ``needed``).
     trace = composite_trace(labels)
     missing = [key for key, band in labels.items() if band == "missing"]
 

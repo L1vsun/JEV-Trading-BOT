@@ -1,8 +1,8 @@
 """MetaTrader 5 terminal adapter.
 
 The official ``MetaTrader5`` package is imported only when a session connects,
-and only on the Windows machine where the terminal is installed. Tests pass a
-fake module in. Credentials are read from the environment inside
+and only on the Windows machine where the terminal is installed. Credentials
+are read from the environment inside
 :func:`jev_bot.risk.read_mt5_credentials` and are never stored on this object
 and never placed in an exception message.
 """
@@ -70,8 +70,9 @@ def _error_code(mt5) -> int:
 
 @dataclass
 class Exposure:
-    net: float                         # signed lots, this magic and symbol only
-    count: int
+    net: float                         # signed lots across the selected magics
+    count: int                         # open position count across those magics
+    lots: float = 0.0                  # sum of abs lots (for max_lots checks)
 
 
 @dataclass
@@ -84,12 +85,15 @@ class OrderReport:
 
 class MT5Broker:
     def __init__(self, symbol: str = "XAUUSD", magic: int = 20261027, deviation: int = 15,
-                 mt5=None, loader=None, clock=None):
+                 mt5=None, loader=None, clock=None, magics: set[int] | None = None):
         if not _SYMBOL_RE.fullmatch(symbol or ""):
             raise SymbolError("invalid symbol")
         self.requested_symbol = symbol
         self.symbol = symbol
-        self.magic = int(magic)
+        self.magic = int(magic)                # base magic (consensus offset 0)
+        self.magics: set[int] = set(int(m) for m in (magics if magics is not None else {self.magic}))
+        if self.magic not in self.magics:
+            self.magics.add(self.magic)
         self.deviation = int(deviation)
         self._mod = mt5
         self._loader = loader or load_mt5
@@ -171,6 +175,20 @@ class MT5Broker:
         info = self._account()
         return trade_mode_name(int(getattr(info, "trade_mode", 2)))
 
+    def equity(self) -> float | None:
+        """Account equity from ``account_info``, or ``None`` when unavailable."""
+        try:
+            info = self._account()
+        except ConnectionLost:
+            return None
+        value = getattr(info, "equity", None)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def describe(self) -> str:
         """Account facts that are safe to print. No login, server or path."""
         info = self._account()
@@ -201,6 +219,7 @@ class MT5Broker:
             raise ConnectionLost("symbol info unavailable")
         point = float(info.point)
         tick_size = float(getattr(info, "trade_tick_size", 0) or point or 0.01)
+        tick_value = float(getattr(info, "trade_tick_value", 0) or tick_size or 1.0)
         return SymbolSpec(
             bid=float(tick.bid), ask=float(tick.ask), point=point,
             digits=int(info.digits),
@@ -213,6 +232,7 @@ class MT5Broker:
             symbol_trade_mode=int(getattr(info, "trade_mode", 4) or 0),
             contract_size=float(getattr(info, "trade_contract_size", 100.0) or 100.0),
             tick_size=tick_size,
+            tick_value=tick_value,
         )
 
     def ensure_clock(self, now_unix: float | None = None) -> int:
@@ -276,6 +296,47 @@ class MT5Broker:
         raw = fn(self.symbol, start, end, _const(mt5, "COPY_TICKS_ALL", 3))
         return self._to_utc(parse_ticks(raw))
 
+    def copy_rates_from_pos(
+        self, symbol: str, timeframe: int, start_pos: int, count: int,
+    ) -> list[tuple[int, float, float, float, float, float, float]]:
+        """Closed OHLC rates with opens converted from broker server time to UTC.
+
+        Each row is ``(time_utc, o, h, l, c, tick_vol, spread)``. Returns an
+        empty list when the terminal call is missing or fails.
+        """
+        mt5 = self._mt5()
+        fn = getattr(mt5, "copy_rates_from_pos", None)
+        if fn is None or count <= 0:
+            return []
+        self.ensure_clock(self.clock())
+        try:
+            raw = fn(symbol, int(timeframe), int(start_pos), int(count))
+        except Exception:
+            return []
+        if raw is None:
+            return []
+        offset = int(self.server_offset)
+        out: list[tuple[int, float, float, float, float, float, float]] = []
+        for row in raw:
+            if hasattr(row, "time"):
+                t = int(row.time) - offset
+                o = float(row.open)
+                h = float(row.high)
+                l = float(row.low)
+                c = float(row.close)
+                tv = float(getattr(row, "tick_volume", 0) or 0)
+                spr = float(getattr(row, "spread", 0) or 0)
+            else:
+                t = int(row[0]) - offset
+                o = float(row[1])
+                h = float(row[2])
+                l = float(row[3])
+                c = float(row[4])
+                tv = float(row[5]) if len(row) > 5 else 0.0
+                spr = float(row[6]) if len(row) > 6 else 0.0
+            out.append((t, o, h, l, c, tv, spr))
+        return out
+
     def poll_ticks(self, since_msc: int, now_unix: float | None = None) -> list[Tick]:
         """Ticks newer than ``since_msc`` (UTC milliseconds). The first call asks for the last few seconds."""
         if not self.healthy():
@@ -328,60 +389,31 @@ class MT5Broker:
         levels = parse_book(raw)
         return levels or None
 
-    def exposure(self) -> Exposure:
+    def exposure(self, magic: int | None = None) -> Exposure:
+        """Net / count / abs-lots for one magic, or all bot magics when ``None``."""
         net = 0.0
-        rows = self._our_positions()
+        lots = 0.0
+        rows = self._our_positions(magic=magic)
         for pos in rows:
             vol = float(getattr(pos, "volume", 0) or 0)
+            lots += abs(vol)
             if int(getattr(pos, "type", 0)) == _POSITION_BUY:
                 net += vol
             else:
                 net -= vol
-        return Exposure(net=net, count=len(rows))
+        return Exposure(net=net, count=len(rows), lots=lots)
 
-    def daily_pnl(self, now: datetime | None = None) -> float:
-        """Realised deals since 00:00 UTC plus floating profit, this magic only.
-
-        The terminal compares the datetime against deal times on the broker
-        clock. The UTC midnight instant is shifted by the measured offset and
-        then written as the machine's local time, which is what the package
-        reads back into a timestamp.
-        """
-        mt5 = self._mt5()
-        now_utc = now or datetime.now(timezone.utc)
-        if now_utc.tzinfo is None:
-            now_utc = now_utc.replace(tzinfo=timezone.utc)
-        else:
-            now_utc = now_utc.astimezone(timezone.utc)
-        start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        self.ensure_clock(self.clock())
-        # Deal times use the broker clock too. 00:00 UTC is that instant plus
-        # the offset, not the UTC fields written through as a naive datetime.
-        start = self._broker_datetime(start_utc.timestamp())
-        end = self._broker_datetime(now_utc.timestamp())
-        fn = getattr(mt5, "history_deals_get", None)
-        deals = fn(start, end) if fn else None
-        realised = 0.0
-        for deal in deals or []:
-            if getattr(deal, "symbol", None) != self.symbol:
-                continue
-            if int(getattr(deal, "magic", -1)) != self.magic:
-                continue
-            realised += float(getattr(deal, "profit", 0) or 0)
-            realised += float(getattr(deal, "commission", 0) or 0)
-            realised += float(getattr(deal, "swap", 0) or 0)
-            realised += float(getattr(deal, "fee", 0) or 0)
-        floating = 0.0
-        for pos in self._our_positions():
-            floating += float(getattr(pos, "profit", 0) or 0)
-            floating += float(getattr(pos, "swap", 0) or 0)
-        return realised + floating
-
-    def send(self, intent: OrderIntent) -> OrderReport:
+    def send(
+        self,
+        intent: OrderIntent,
+        *,
+        magic: int | None = None,
+        comment: str = "jev",
+    ) -> OrderReport:
         if not self.healthy():
             raise ConnectionLost("terminal disconnected")
         mt5 = self._mt5()
-        request = self._request(intent)
+        request = self._request(intent, magic=magic, comment=comment)
         result = mt5.order_send(request)
         if result is None:
             if not self.healthy():
@@ -397,14 +429,18 @@ class MT5Broker:
         volume = float(getattr(result, "volume", 0) or intent.volume)
         return OrderReport(ret in done, ret, price, volume)
 
-    def close_all(self) -> list[OrderReport]:
-        """Close positions this bot opened on its symbol. Other magics stay."""
+    def close_all(self, magic: int | None = None) -> list[OrderReport]:
+        """Close bot positions on this symbol. Foreign magics are never touched.
+
+        ``magic=None`` closes every magic in ``self.magics``; a concrete value
+        closes only that magic.
+        """
         if not self.healthy():
             raise ConnectionLost("terminal disconnected")
         mt5 = self._mt5()
         hedging = self._hedging()
         reports: list[OrderReport] = []
-        for pos in self._our_positions():
+        for pos in self._our_positions(magic=magic):
             vol = float(getattr(pos, "volume", 0) or 0)
             if vol <= 0:
                 continue
@@ -421,11 +457,12 @@ class MT5Broker:
                 filling = select_filling(int(getattr(info, "filling_mode", 0) or 0),
                                           int(getattr(info, "trade_exemode", 0) or 0))
                 digits = int(info.digits)
+            pos_magic = int(getattr(pos, "magic", self.magic))
             intent = OrderIntent(
                 side=side, volume=vol, price=round(price, digits), sl=0.0, tp=0.0,
                 deviation=self.deviation, filling=filling, digits=digits, volume_digits=2,
             )
-            request = self._request(intent)
+            request = self._request(intent, magic=pos_magic, comment="jev:close")
             if hedging:
                 request["position"] = int(getattr(pos, "ticket", 0))
             result = mt5.order_send(request)
@@ -442,8 +479,16 @@ class MT5Broker:
             ), ret, float(getattr(result, "price", 0) or price), vol))
         return reports
 
-    def _request(self, intent: OrderIntent) -> dict:
+    def _request(
+        self,
+        intent: OrderIntent,
+        *,
+        magic: int | None = None,
+        comment: str = "jev",
+    ) -> dict:
         mt5 = self._mt5()
+        used_magic = int(self.magic if magic is None else magic)
+        text = (comment or "jev")[:31]
         return {
             "action": _const(mt5, "TRADE_ACTION_DEAL", 1),
             "symbol": self.symbol,
@@ -453,8 +498,8 @@ class MT5Broker:
             "sl": float(intent.sl),
             "tp": float(intent.tp),
             "deviation": int(intent.deviation),
-            "magic": self.magic,
-            "comment": "jev",
+            "magic": used_magic,
+            "comment": text,
             "type_time": _const(mt5, "ORDER_TIME_GTC", 0),
             "type_filling": int(intent.filling),
         }
@@ -463,13 +508,19 @@ class MT5Broker:
         info = self._account()
         return int(getattr(info, "margin_mode", 0)) == _HEDGING
 
-    def _our_positions(self) -> list:
+    def _our_positions(self, magic: int | None = None) -> list:
+        """Positions on this symbol owned by the bot magic family (never foreign)."""
         mt5 = self._mt5()
         fn = getattr(mt5, "positions_get", None)
         rows = fn(symbol=self.symbol) if fn else None
+        if magic is None:
+            allowed = self.magics
+        else:
+            allowed = {int(magic)}
         out = []
         for pos in rows or []:
-            if int(getattr(pos, "magic", -1)) != self.magic:
+            pos_magic = int(getattr(pos, "magic", -1))
+            if pos_magic not in allowed:
                 continue
             if getattr(pos, "symbol", self.symbol) != self.symbol:
                 continue

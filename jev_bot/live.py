@@ -1,9 +1,8 @@
-"""Live loop: a broker feed in place of the simulator, the same decision path.
+"""Live loop: a broker feed, the same decision path, always-send orders.
 
-``features.py``, ``state.py`` and ``decide.py`` are used as they are. The
-only difference from ``cmd_paper`` is where the one-second book comes from
-and where an order goes. A lost terminal flattens and stops. A Jev error
-holds that bar and leaves the loop running.
+``features.py``, ``state.py`` and the strategy router are used as they are.
+A lost terminal flattens and stops. A Jev error holds that bar and leaves the
+loop running. There is no dry-run path.
 """
 from __future__ import annotations
 
@@ -12,16 +11,27 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from .decide import Decision
+from .bars import DEFAULT_BACKFILL, MultiTFBooks, TF_ENUM
 from .features import feature_matrix
 from .mt5_feed import MarketBuffer, Tick, TickAggregator, depth_note
 from .quant import FairValueModel
 from .state import StateBuilder
 from .strategies import StrategyFlags, StrategyRouter, build_context
+from .strategies.magics import (
+    ENTRY_STRATEGIES,
+    all_bot_magics,
+    magic_for,
+    magic_table,
+    order_comment,
+)
+from .strategies.mtf_base import MtfLimits, default_mtf_limits
 from .risk import (
     AvoidHours,
     ConnectionLost,
     KillSwitch,
+    LOT_MODE_EQUITY_SCALED,
+    LOT_MODE_FIXED,
+    LotScaling,
     MarketHours,
     RiskError,
     RiskLimits,
@@ -30,22 +40,42 @@ from .risk import (
     build_order,
     check_entry,
     format_intent,
-    loss_breached,
+    lot_stage_table,
     parse_avoid_hours,
     position_text,
     redact,
     require_berlin,
     require_new_york,
+    scaled_lot,
     stop_exit,
 )
 from .typesafe import JevError, payload_text
 
 
+@dataclass
+class TrackedPosition:
+    """Local SL/TP/hold bookkeeping for one bot magic."""
+
+    side: int = 0
+    qty: float = 0.0
+    px_in: float = 0.0
+    t_in: int = 0
+    sl: float = 0.0
+    tp: float = 0.0
+    hold_seconds: int = 0
+    strategy: str = ""
+
+    def clear_stops(self) -> None:
+        self.sl = 0.0
+        self.tp = 0.0
+        self.t_in = 0
+        self.px_in = 0.0
+        self.hold_seconds = 0
+
+
 def describe_model(jev) -> str:
     """Header text for the model that will actually answer. Never includes a key."""
     name = getattr(jev, "model", "?")
-    if str(name).startswith("surrogate"):
-        return f"{name} (offline stand-in, not Jev)"
     return f"{name} (TypeSafe Jev)"
 
 
@@ -82,6 +112,27 @@ def mark_depth(state: dict, available: bool) -> dict:
     return state
 
 
+_MTF_FLAG_NAMES = (
+    "m5_ny_orb", "m5_asianbox", "m5_vwap_pb",
+    "m15_ny_orb", "m15_asia_squeeze", "m15_trend_pullback",
+    "h1_trend_long", "h1_pullback", "h1_prevday_break",
+    "h4_donchian", "h4_ema_pullback", "h4_zone_retest",
+    "pullback_m1", "pullback_m5", "pullback_m15", "pullback_h1", "pullback_h4",
+)
+
+
+def flags_need_mtf(flags: StrategyFlags) -> bool:
+    return any(getattr(flags, name, False) for name in _MTF_FLAG_NAMES)
+
+
+def _any_entry_strategy(flags: StrategyFlags) -> bool:
+    if flags.consensus or flags.vwap_fade or flags.orb:
+        return True
+    if flags.pa_rejection or flags.pa_insidebar:
+        return True
+    return flags_need_mtf(flags)
+
+
 @dataclass
 class LiveConfig:
     symbol: str = "XAUUSD"
@@ -90,10 +141,11 @@ class LiveConfig:
     history: int = 7200
     levels: int = 5
     fallback_size: float = 1.0
-    dry_run: bool = True
     allow_real: bool = False
     kill_file: str = "jev.KILL"
     magic: int = 20261027
+    magic_offsets: dict[str, int] = field(default_factory=dict)
+    no_hedge: bool = False
     max_silence: float = 30.0
     max_gap: int = 10
     hours: str = "gold"
@@ -101,15 +153,44 @@ class LiveConfig:
     max_hold_seconds: int = 900
     avoid: AvoidHours | None = None
     limits: RiskLimits = field(default_factory=RiskLimits)
-    strategies: StrategyFlags = field(default_factory=StrategyFlags)
+    strategies: StrategyFlags = field(default_factory=lambda: StrategyFlags(consensus=False))
+    lot_scaling: LotScaling = field(default_factory=LotScaling)
+    backfill: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_BACKFILL))
+    mtf_limits: MtfLimits = field(default_factory=default_mtf_limits)
+    allow_short: bool = False
+    h4_ema_allow_short: bool = False
+    h1_use_sma50_200: bool = False
+
+
+def parse_magic_offset_json(text: str | None) -> dict[str, int]:
+    """Parse optional ``--magic-offset-json`` overrides onto the central table."""
+    if not text:
+        return {}
+    import json
+    raw = json.loads(text)
+    if not isinstance(raw, dict):
+        raise RiskError("--magic-offset-json must be a JSON object of strategy→offset")
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RiskError(f"invalid magic offset for {key!r}") from exc
+    return out
 
 
 def live_config_from_args(args) -> LiveConfig:
-    if getattr(args, "dry_run", False) and getattr(args, "send", False):
-        raise RiskError("pass only one of --dry-run and --send")
+    lot_scaling = LotScaling(
+        mode=getattr(args, "lot_mode", LOT_MODE_EQUITY_SCALED),
+        base=float(getattr(args, "lot_base", 0.01)),
+        start_equity=float(getattr(args, "lot_start_equity", 1000.0)),
+        factor=float(getattr(args, "lot_factor", 1.5)),
+    )
+    lot_scaling.validate()
+    lot = float(args.lot) if lot_scaling.mode == LOT_MODE_FIXED else float(lot_scaling.base)
     limits = RiskLimits(
-        max_lots=args.max_lots, max_positions=args.max_positions, max_daily_loss=args.max_daily_loss,
-        max_spread_points=args.max_spread, lot=args.lot, sl_points=args.sl_points, tp_points=args.tp_points,
+        max_lots=args.max_lots, max_positions=args.max_positions,
+        max_spread_points=args.max_spread, lot=lot, sl_points=args.sl_points, tp_points=args.tp_points,
         deviation_points=args.deviation,
     )
     limits.validate()
@@ -123,28 +204,83 @@ def live_config_from_args(args) -> LiveConfig:
         raise RiskError("history must cover the warmup")
     if args.hours not in ("gold", "always"):
         raise RiskError("market hours must be 'gold' or 'always'")
-    strategies = StrategyFlags(
-        consensus=bool(getattr(args, "sig_consensus", True)),
-        vwap_fade=bool(getattr(args, "sig_vwap_fade", False)),
-        orb=bool(getattr(args, "sig_orb", False)),
-        session_dir=bool(getattr(args, "filter_session_dir", False)),
-        pa_rejection=bool(getattr(args, "sig_pa_rejection", False)),
-        pa_insidebar=bool(getattr(args, "sig_pa_insidebar", False)),
-        pa_structure=bool(getattr(args, "sig_pa_structure", False)),
-    )
-    if not (
-        strategies.consensus or strategies.vwap_fade or strategies.orb
-        or strategies.pa_rejection or strategies.pa_insidebar
-    ):
+    if not bool(getattr(args, "allow_real", False)):
         raise RiskError(
-            "enable at least one of --sig-consensus, --sig-vwap-fade, --sig-orb, "
-            "--sig-pa-rejection, --sig-pa-insidebar"
+            "live always sends orders; pass --allow-real and set MT5_CONFIRM_REAL "
+            "to the confirmation phrase"
         )
+
+    # Start from --strategies if given, else all off (including consensus).
+    base = getattr(args, "strategy_flags", None)
+    if base is None:
+        strategies = StrategyFlags(consensus=False)
+    else:
+        strategies = base
+
+    # Individual --sig-* flags OR onto the base (consensus default is off).
+    updates: dict[str, bool] = {}
+    if bool(getattr(args, "sig_consensus", False)):
+        updates["consensus"] = True
+    if bool(getattr(args, "sig_vwap_fade", False)):
+        updates["vwap_fade"] = True
+    if bool(getattr(args, "sig_orb", False)):
+        updates["orb"] = True
+    if bool(getattr(args, "filter_session_dir", False)):
+        updates["session_dir"] = True
+    if bool(getattr(args, "sig_pa_rejection", False)):
+        updates["pa_rejection"] = True
+    if bool(getattr(args, "sig_pa_insidebar", False)):
+        updates["pa_insidebar"] = True
+    if bool(getattr(args, "sig_pa_structure", False)):
+        updates["pa_structure"] = True
+    for tf in ("m1", "m5", "m15", "h1", "h4"):
+        attr = f"sig_pullback_{tf}"
+        if bool(getattr(args, attr, False)):
+            updates[f"pullback_{tf}"] = True
+    allow_short = bool(getattr(args, "allow_short", False)) or bool(strategies.allow_short)
+    if updates:
+        strategies = replace(strategies, **updates)
+    strategies = replace(strategies, allow_short=allow_short)
+
+    if not _any_entry_strategy(strategies):
+        raise RiskError(
+            "enable at least one entry strategy via --strategies or "
+            "--sig-consensus / --sig-vwap-fade / --sig-orb / "
+            "--sig-pa-rejection / --sig-pa-insidebar / an MTF name"
+        )
+
+    mtf = default_mtf_limits()
+    min_sl = dict(mtf.min_sl_points)
+    for tf, attr in (("M5", "min_sl_m5"), ("M15", "min_sl_m15"), ("H1", "min_sl_h1"), ("H4", "min_sl_h4")):
+        val = getattr(args, attr, None)
+        if val is not None:
+            if float(val) < 0:
+                raise RiskError(f"{attr} must be >= 0")
+            min_sl[tf] = float(val)
+    mtf = MtfLimits(
+        min_sl_points=min_sl,
+        k_sl=dict(mtf.k_sl),
+        max_bars=dict(mtf.max_bars),
+        max_cost_share=dict(mtf.max_cost_share),
+        allow_short=allow_short,
+        global_max_hold=hold,
+        max_spread_points=float(limits.max_spread_points),
+    )
+
+    backfill = getattr(args, "backfill", None) or dict(DEFAULT_BACKFILL)
+    magic_offsets = parse_magic_offset_json(getattr(args, "magic_offset_json", None))
+
     return LiveConfig(
         symbol=args.symbol, step=args.step, warmup=args.warmup, history=args.history,
-        levels=args.levels, dry_run=not bool(args.send), allow_real=bool(args.allow_real),
-        kill_file=args.kill_file, magic=args.magic, hours=args.hours, verbose=bool(args.verbose),
+        levels=getattr(args, "levels", 5), allow_real=True,
+        kill_file=args.kill_file, magic=args.magic, magic_offsets=magic_offsets,
+        no_hedge=bool(getattr(args, "no_hedge", False)),
+        hours=args.hours, verbose=bool(args.verbose),
         max_hold_seconds=hold, avoid=avoid, limits=limits, strategies=strategies,
+        lot_scaling=lot_scaling, backfill=dict(backfill), mtf_limits=mtf,
+        allow_short=allow_short,
+        h4_ema_allow_short=bool(getattr(args, "h4_ema_allow_short", False)),
+        h1_use_sma50_200=bool(getattr(args, "h1_sma50_200", False)),
     )
 
 
@@ -162,21 +298,80 @@ class LiveSession:
         self.clock = clock or time.time
         self.agg = TickAggregator(self.cfg.levels, self.cfg.fallback_size, self.cfg.max_gap)
         self.buffer = MarketBuffer(self.cfg.history, max_gap=self.cfg.max_gap)
-        self.router = StrategyRouter(flags=self.cfg.strategies)
-        self.position = 0
-        self.qty = 0.0
-        self.px_in = 0.0
-        self.t_in = 0
-        self.sl = 0.0
-        self.tp = 0.0
-        self.pos_hold_seconds = 0
-        self.realized = 0.0
+        self.router = StrategyRouter(
+            flags=self.cfg.strategies,
+            base_magic=self.cfg.magic,
+            magic_overrides=dict(self.cfg.magic_offsets),
+        )
+        self.mtf_books: MultiTFBooks | None = None
+        if flags_need_mtf(self.cfg.strategies):
+            self.mtf_books = MultiTFBooks()
+        # Per-magic bookkeeping. Foreign magics are never written here.
+        self.by_magic: dict[int, TrackedPosition] = {}
+        self.magic_strategy: dict[int, str] = {}
+        for name, offset in magic_table(self.cfg.magic_offsets).items():
+            m = int(self.cfg.magic) + int(offset)
+            self.magic_strategy[m] = name
+            self.by_magic[m] = TrackedPosition(strategy=name)
+        # Ensure broker knows the full bot magic family.
+        bot_magics = all_bot_magics(self.cfg.magic, self.cfg.magic_offsets)
+        if hasattr(self.broker, "magics"):
+            self.broker.magics = set(bot_magics)
+            self.broker.magic = int(self.cfg.magic)
         self.last_msc = 0
         self._contract = 0.0
+        self._tick_value = 1.0
+        self._tick_size = 0.01
         self._depth_logged = False
         self._warm_logged = False
         self._answered = False
         self._last_tick_wall: float | None = None
+        self._session_lot: float | None = None
+        self._lot_day = None
+        self._lot_equity: float | None = None
+
+    def magic_of(self, strategy: str) -> int:
+        return magic_for(strategy, self.cfg.magic, self.cfg.magic_offsets or None)
+
+    def _tracked(self, magic: int) -> TrackedPosition:
+        pos = self.by_magic.get(magic)
+        if pos is None:
+            pos = TrackedPosition(strategy=self.magic_strategy.get(magic, ""))
+            self.by_magic[magic] = pos
+        return pos
+
+    def _positions_by_strategy(self) -> dict[str, int]:
+        """Side map keyed by strategy name for the router."""
+        out: dict[str, int] = {}
+        for magic, tracked in self.by_magic.items():
+            name = tracked.strategy or self.magic_strategy.get(magic, "")
+            if name:
+                out[name] = int(tracked.side)
+        return out
+
+    def _open_count(self) -> int:
+        return sum(1 for p in self.by_magic.values() if p.side)
+
+    def _any_open(self) -> bool:
+        return self._open_count() > 0
+
+    def _hedge_blocked(self, side: int) -> bool:
+        if not self.cfg.no_hedge:
+            return False
+        for pos in self.by_magic.values():
+            if pos.side and pos.side != side:
+                return True
+        return False
+
+    def _primary_tracked(self) -> TrackedPosition:
+        """Prefer consensus, else first open, else a flat placeholder for state text."""
+        cons = self.magic_of("consensus") if "consensus" in magic_table(self.cfg.magic_offsets) else None
+        if cons is not None and cons in self.by_magic:
+            return self.by_magic[cons]
+        for pos in self.by_magic.values():
+            if pos.side:
+                return pos
+        return TrackedPosition()
 
     def ensure_allowed(self) -> None:
         if self.cfg.hours == "gold":
@@ -184,6 +379,7 @@ class LiveSession:
         if self.cfg.avoid is not None:
             require_berlin()
         self.limits.validate()
+        self.cfg.lot_scaling.validate()
         if self.cfg.max_hold_seconds < 0:
             raise RiskError("max_hold_seconds must be >= 0")
         if self.cfg.step < 1 or self.cfg.warmup < 300 or self.cfg.history < self.cfg.warmup:
@@ -191,17 +387,58 @@ class LiveSession:
         if not 1 <= self.cfg.levels <= 10:
             raise RiskError("levels must be between 1 and 10")
         assert_may_send(
-            self.broker.trade_mode(), dry_run=self.cfg.dry_run, allow_real=self.cfg.allow_real,
+            self.broker.trade_mode(), dry_run=False, allow_real=True,
             confirm=os.environ.get("MT5_CONFIRM_REAL"),
         )
-        if not self.cfg.dry_run:
-            from .mt5_broker import require_algo_trading
-            require_algo_trading(self.broker)
+        from .mt5_broker import require_algo_trading
+        require_algo_trading(self.broker)
         spec = self.broker.spec()
-        if self.limits.lot < spec.volume_min - 1e-12:
+        self._refresh_lot(force=True)
+        if self.effective_lot() < spec.volume_min - 1e-12:
             raise RiskError("lot is below the broker minimum")
         self.buffer.tick = spec.tick_size or spec.point or 0.01
         self._contract = spec.contract_size or 1.0
+        self._tick_size = float(getattr(spec, "tick_size", 0) or spec.point or 0.01)
+        self._tick_value = float(getattr(spec, "tick_value", 0) or self._tick_size)
+
+    def effective_lot(self) -> float:
+        if self._session_lot is not None:
+            return float(self._session_lot)
+        return float(self.limits.lot)
+
+    def _refresh_lot(self, *, force: bool = False) -> None:
+        """Recompute equity-scaled lot once per UTC day, never mid-position."""
+        if self._any_open():
+            return
+        day = self.now().astimezone(timezone.utc).date()
+        if not force and self._lot_day == day and self._session_lot is not None:
+            return
+        scaling = self.cfg.lot_scaling
+        spec = self.broker.spec()
+        if scaling.mode == LOT_MODE_FIXED:
+            self._session_lot = float(self.limits.lot)
+            self._lot_equity = None
+        else:
+            equity = None
+            eq_fn = getattr(self.broker, "equity", None)
+            if callable(eq_fn):
+                try:
+                    equity = eq_fn()
+                except Exception:
+                    equity = None
+            self._lot_equity = float(equity) if equity is not None else None
+            self._session_lot = scaled_lot(
+                equity,
+                base=scaling.base,
+                start=scaling.start_equity,
+                factor=scaling.factor,
+                volume_min=float(spec.volume_min),
+                volume_step=float(spec.volume_step),
+                max_lots=float(self.limits.max_lots),
+            )
+        self._lot_day = day
+        # Keep RiskLimits.lot in sync so strategies reading limits.lot see the stage.
+        self.limits = replace(self.limits, lot=float(self._session_lot))
 
     def run(self, max_steps: int | None = None) -> None:
         try:
@@ -214,7 +451,9 @@ class LiveSession:
             self.ensure_allowed()
             self.broker.ensure_clock(self.clock())
             self._announce()
+            self._smoke_jev()
             self._backfill()
+            self._backfill_mtf()
             steps = 0
             while max_steps is None or steps < max_steps:
                 self._one_poll()
@@ -230,57 +469,145 @@ class LiveSession:
         finally:
             self.broker.shutdown()
 
+    def _smoke_jev(self) -> None:
+        """Abort before any order when Jev is unreachable at startup.
+
+        During the running loop, Jev errors still hold that bar (existing behavior).
+        """
+        if not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+            raise RiskError(
+                "TYPESAFE_API_KEY is required at live start; aborting with no orders"
+            )
+        try:
+            models_fn = getattr(self.jev, "models", None)
+            if not callable(models_fn):
+                raise JevError("Jev client has no models() smoke probe")
+            listed = models_fn()
+        except JevError as exc:
+            raise RiskError(
+                f"Jev unreachable at startup; aborting with no orders: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RiskError(
+                f"Jev unreachable at startup; aborting with no orders: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        n = len(listed) if listed is not None else 0
+        self._log(f"jev smoke ok · {n} model(s) reachable")
+
     def _announce(self) -> None:
         spec = self.broker.spec()
-        mode = "DRY-RUN" if self.cfg.dry_run else "SEND"
         avoid = "off" if self.cfg.avoid is None else f"{self.cfg.avoid.text} Europe/Berlin"
         self._log(
-            f"live · mt5 · {self.broker.symbol} · {mode} · model {describe_model(self.jev)} · "
+            f"live · mt5 · {self.broker.symbol} · SEND · model {describe_model(self.jev)} · "
             f"{self.broker.describe()}"
         )
-        flags = self.cfg.strategies
-        sigs = (
-            f"consensus={'on' if flags.consensus else 'off'} · "
-            f"vwap_fade={'on' if flags.vwap_fade else 'off'} · "
-            f"orb={'on' if flags.orb else 'off'} · "
-            f"session_dir={'on' if flags.session_dir else 'off'} · "
-            f"pa_rejection={'on' if flags.pa_rejection else 'off'} · "
-            f"pa_insidebar={'on' if flags.pa_insidebar else 'off'} · "
-            f"pa_structure={'on' if flags.pa_structure else 'off'}"
+        names = self.router.enabled_names()
+        mtf_note = (
+            f" · allow_short={'on' if self.cfg.allow_short else 'off'}"
+            f" · h4_ema_allow_short={'on' if self.cfg.h4_ema_allow_short else 'off'}"
+            f" · h1_sma50_200={'on' if self.cfg.h1_use_sma50_200 else 'off'}"
         )
         self._log(
-            f"limits · lot {self.limits.lot:g} · max_lots {self.limits.max_lots:g} · "
-            f"max_positions {self.limits.max_positions} · max_daily_loss {self.limits.max_daily_loss:g} · "
+            f"limits · lot {self.effective_lot():g} · max_lots {self.limits.max_lots:g} · "
+            f"max_positions {self.limits.max_positions} · no_hedge={'on' if self.cfg.no_hedge else 'off'} · "
             f"max_spread {self.limits.max_spread_points:g} · {_shown('sl_points', self.limits.sl_points)} · "
             f"{_shown('tp_points', self.limits.tp_points)} · deviation {self.limits.deviation_points} · "
             f"{_shown('max_hold_seconds', self.cfg.max_hold_seconds)} · avoid_hours {avoid} · "
             f"hours {self.cfg.hours} · step {self.cfg.step}s · warmup {self.cfg.warmup}s · "
-            f"contract {spec.contract_size:g} · point {spec.point:g}"
+            f"contract {spec.contract_size:g} · point {spec.point:g} · magic_base {self.cfg.magic}"
         )
-        self._log(f"strategies · {sigs}")
-        if str(getattr(self.jev, "model", "")).startswith("surrogate"):
-            if (os.environ.get("TYPESAFE_API_KEY") or "").strip():
-                self._log("WARNING: live is using the offline surrogate, not TypeSafe Jev.")
-            else:
-                self._log(
-                    "WARNING: TYPESAFE_API_KEY is not set. Live decisions use the offline "
-                    "surrogate (surrogate-local), not TypeSafe Jev."
-                )
-        if not self.cfg.dry_run and self.broker.trade_mode() == "real":
+        self._log(f"strategies · {', '.join(names) if names else '(none)'}{mtf_note}")
+        entry = [n for n in names if n in ENTRY_STRATEGIES]
+        if entry:
+            parts = [f"{n}={self.magic_of(n)}" for n in entry]
+            self._log(f"magics · {', '.join(parts)}")
+        self._log_lot_table()
+        if self.broker.trade_mode() == "real":
             self._log("REAL MONEY: orders will be sent on this account")
+        else:
+            self._log(
+                f"DEMO/CONTEST: orders will still be sent (--allow-real + confirm required)"
+            )
         self._log(self.broker.clock_text())
+
+    def _log_lot_table(self) -> None:
+        scaling = self.cfg.lot_scaling
+        if scaling.mode == LOT_MODE_FIXED:
+            self._log(f"lot · mode fixed · lot {self.effective_lot():g}")
+            return
+        spec = self.broker.spec()
+        rows = lot_stage_table(
+            max_equity=max(20_000.0, float(scaling.start_equity) * (scaling.factor ** 6)),
+            base=scaling.base,
+            start=scaling.start_equity,
+            factor=scaling.factor,
+            volume_min=float(spec.volume_min),
+            volume_step=float(spec.volume_step),
+            max_lots=float(self.limits.max_lots),
+        )
+        snippet = rows[:6]
+        parts = [
+            f"n={r['stage']} equity>={r['equity_from']:g} lot={r['lot']:g}"
+            for r in snippet
+        ]
+        eq = "n/a" if self._lot_equity is None else f"{self._lot_equity:g}"
+        self._log(
+            f"lot · mode equity-scaled · equity {eq} · current {self.effective_lot():g} · "
+            f"stages: {'; '.join(parts)}"
+        )
 
     def _backfill(self) -> None:
         ticks = self.broker.history_ticks(self.cfg.history, now_unix=self.clock())
         bars = self.agg.bars(ticks, None) if ticks else []
         for bar in bars:
             self.buffer.append(bar)
+            self._feed_mtf_bar(bar)
         if ticks:
             self.last_msc = max(t.time_msc for t in ticks)
             self._last_tick_wall = self.clock()
             self._log(f"backfill {len(self.buffer)}s from terminal tick history (no depth in history)")
         else:
             self._log(f"no tick history; collecting {self.cfg.warmup}s before the first decision")
+
+    def _backfill_mtf(self) -> None:
+        if self.mtf_books is None:
+            return
+        copy_fn = getattr(self.broker, "copy_rates_from_pos", None)
+        if not callable(copy_fn):
+            self._log("mtf · broker has no copy_rates_from_pos; higher-TF books stay empty until ticks fill them")
+            return
+        for tf, count in self.cfg.backfill.items():
+            tf_enum = TF_ENUM.get(tf)
+            if tf_enum is None:
+                continue
+            try:
+                rows = copy_fn(self.broker.symbol, tf_enum, 0, int(count))
+            except Exception as exc:
+                self._log(f"mtf · {tf} backfill failed: {redact(str(exc))}")
+                continue
+            if not rows:
+                self._log(f"mtf · {tf} backfill empty")
+                continue
+            builder = self.mtf_books.get(tf)
+            builder.seed_from_rates(rows)
+            # Drop the still-forming candle (pos 0 is usually the current bar).
+            if builder.bars:
+                now_u = int(self.clock())
+                tf_sec = builder.tf_seconds
+                builder.bars = [b for b in builder.bars if b.t + tf_sec <= now_u]
+            self._log(f"mtf · {tf} backfill {len(builder.bars)} closed bars")
+
+    def _feed_mtf_bar(self, bar) -> None:
+        if self.mtf_books is None:
+            return
+        # One-second book mid as a tick into higher-TF builders.
+        self.mtf_books.on_tick(int(bar.t), float(bar.bid), float(bar.ask))
+
+    def _mtf_closed(self) -> dict | None:
+        if self.mtf_books is None:
+            return None
+        return {tf: builder.closed() for tf, builder in self.mtf_books.books.items()}
 
     def _one_poll(self) -> None:
         self._check_kill()
@@ -343,12 +670,10 @@ class LiveSession:
 
     def on_bar(self, bar, now: datetime):
         self._check_kill()
+        self._feed_mtf_bar(bar)
         if self.buffer.append(bar):
             self._warm_logged = False
             self._log("feed gap; warmup started again")
-        if loss_breached(self.pnl(bar), self.limits.max_daily_loss):
-            self.flatten("daily loss limit")
-            raise TradingHalted("daily loss limit")
         if not self.hours.is_open(now):
             if self._has_position():
                 self.flatten("market closed")
@@ -364,44 +689,42 @@ class LiveSession:
             return None
         return self._decide(bar, now)
 
-    def pnl(self, bar) -> float:
-        if not self.cfg.dry_run:
-            return self.broker.daily_pnl(self.now())
-        if self.position == 0:
-            return self.realized
-        px = bar.bid if self.position > 0 else bar.ask
-        return self.realized + (px - self.px_in) * self.position * self.qty * (self._contract or 1.0)
+    def _account_equity(self) -> float | None:
+        """Current account equity for the SL plausibility check, or ``None``."""
+        eq_fn = getattr(self.broker, "equity", None)
+        if callable(eq_fn):
+            try:
+                value = eq_fn()
+            except Exception:
+                value = None
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+        if self._lot_equity is not None:
+            return float(self._lot_equity)
+        return None
 
     def _has_position(self) -> bool:
         self.sync()
-        return self.position != 0
+        return self._any_open()
 
     def sync(self) -> None:
-        if self.cfg.dry_run:
-            return
-        exp = self.broker.exposure()
-        self.qty = abs(exp.net)
-        if exp.count == 0 or abs(exp.net) < 1e-12:
-            self.position = 0
-            self.qty = 0.0
-        else:
-            self.position = 1 if exp.net > 0 else -1
-
-    def _clear_stops(self) -> None:
-        self.sl = 0.0
-        self.tp = 0.0
-        self.t_in = 0
-        self.px_in = 0.0
-        self.pos_hold_seconds = 0
+        """Refresh side/qty for every bot magic from the terminal. Foreign magics ignored."""
+        for magic in list(self.by_magic):
+            exp = self.broker.exposure(magic=magic)
+            tracked = self._tracked(magic)
+            if exp.count == 0 or abs(exp.net) < 1e-12:
+                tracked.side = 0
+                tracked.qty = 0.0
+            else:
+                tracked.side = 1 if exp.net > 0 else -1
+                tracked.qty = abs(exp.net)
 
     def flatten(self, reason: str) -> None:
+        """Close every bot magic. Kill file and session exits use this path."""
         self._log(f"flatten: {reason}")
-        if self.cfg.dry_run:
-            if self.position:
-                self.position = 0
-                self.qty = 0.0
-            self._clear_stops()
-            return
         try:
             reports = self.broker.close_all()
         except ConnectionLost:
@@ -410,56 +733,65 @@ class LiveSession:
         for rep in reports:
             if not rep.ok:
                 self._log(f"flatten: close rejected retcode={rep.retcode}")
-        self._clear_stops()
+        for tracked in self.by_magic.values():
+            tracked.side = 0
+            tracked.qty = 0.0
+            tracked.clear_stops()
         try:
             self.sync()
         except ConnectionLost:
             self._log("flatten: terminal already gone")
 
     def _protect(self, bar) -> bool:
-        """Close on a stop or the hold limit. True means this bar is done.
+        """Per-magic stop / hold management. True means this bar is done.
 
-        Dry-run fills the stop at the same rounded price the order would have
-        carried. Live leaves that stop on the position and only logs it once
-        the terminal reports the position gone, so a market close cannot race
-        the broker fill. The hold limit is ours in both modes.
+        Live leaves broker stops on each position and only logs once the
+        terminal reports that magic flat. The hold limit is ours, per magic.
         """
-        if not self.cfg.dry_run:
-            side, sl, tp = self.position, self.sl, self.tp
-            self.sync()
-            if side and not self.position:
+        snapshot = {
+            magic: (tracked.side, tracked.sl, tracked.tp, tracked.strategy)
+            for magic, tracked in self.by_magic.items()
+        }
+        self.sync()
+        acted = False
+        for magic, (side, sl, tp, strategy) in snapshot.items():
+            tracked = self._tracked(magic)
+            if side and not tracked.side:
                 hit = stop_exit(side, bar.bid, bar.ask, sl, tp)
                 reason = hit[0] if hit else "broker close"
                 px = hit[1] if hit else None
-                self.qty = 0.0
-                self._clear_stops()
+                tracked.clear_stops()
                 price = f" @ {px:.2f}" if px is not None else ""
-                self._log(f"EXIT{price} ({reason})")
-                return True
-        if not self.position:
-            return False
-        if self.t_in == 0:
-            self.t_in = bar.t
-            if not self.px_in:
-                self.px_in = bar.bid if self.position > 0 else bar.ask
-            return False
-        if self.cfg.dry_run:
-            hit = stop_exit(self.position, bar.bid, bar.ask, self.sl, self.tp)
-            if hit:
-                reason, px = hit
-                self._log(self._close(bar, reason, px=px))
-                return True
-        limit = self.pos_hold_seconds or self.cfg.max_hold_seconds
-        if limit and bar.t - self.t_in >= limit:
-            self._log(self._close(bar, f"max hold {limit}s"))
-            return True
-        return False
+                self._log(
+                    f"EXIT{price} ({reason}) · magic={magic} · strategy={strategy or '-'}"
+                )
+                acted = True
+                continue
+            if not tracked.side:
+                continue
+            if tracked.t_in == 0:
+                tracked.t_in = bar.t
+                if not tracked.px_in:
+                    tracked.px_in = bar.bid if tracked.side > 0 else bar.ask
+                continue
+            limit = tracked.hold_seconds or self.cfg.max_hold_seconds
+            if limit and bar.t - tracked.t_in >= limit:
+                self._log(self._close_magic(
+                    magic, bar, f"max hold {limit}s", strategy=tracked.strategy,
+                ))
+                acted = True
+        return acted
 
     def _decide(self, bar, now: datetime):
         self.sync()
-        if not self.cfg.dry_run and self.position and self.t_in == 0:
-            self.t_in = bar.t
-            self.px_in = bar.bid if self.position > 0 else bar.ask
+        for tracked in self.by_magic.values():
+            if tracked.side and tracked.t_in == 0:
+                tracked.t_in = bar.t
+                tracked.px_in = bar.bid if tracked.side > 0 else bar.ask
+        if not self._any_open():
+            self._refresh_lot()
+        positions = self._positions_by_strategy()
+        primary = self._primary_tracked()
         try:
             mkt = self.buffer.market()
             X, _, raw = feature_matrix(mkt)
@@ -467,22 +799,35 @@ class LiveSession:
             fair_z = FairValueModel(X.shape[1]).run(X, raw["mid"], raw["rv"], warmup=warm)
             state = StateBuilder(raw, fair_z).state(
                 len(mkt) - 1,
-                position_text(self.position, bar.t, self.t_in, self.px_in, bar.bid, bar.ask),
+                position_text(primary.side, bar.t, primary.t_in, primary.px_in, bar.bid, bar.ask),
             )
             mark_depth(state, self.buffer.depth_live)
             spec = self.broker.spec()
+            self._tick_size = float(getattr(spec, "tick_size", 0) or spec.point or 0.01)
+            self._tick_value = float(getattr(spec, "tick_value", 0) or self._tick_size)
             ctx = build_context(
                 now=now, bar_t=bar.t, mid=float(raw["mid"][-1]), bid=bar.bid, ask=bar.ask,
-                point=spec.point, digits=spec.digits, position=self.position, semantic=state,
+                point=spec.point, digits=spec.digits, position=primary.side, semantic=state,
                 times=[int(x) for x in mkt.t], mids=[float(x) for x in raw["mid"]],
                 buy_vol=[float(x) for x in mkt.buy_vol], sell_vol=[float(x) for x in mkt.sell_vol],
                 limits=self.limits, max_hold_seconds=self.cfg.max_hold_seconds,
                 avoid=self.cfg.avoid,
+                mtf=self._mtf_closed(),
+                mtf_limits=self.cfg.mtf_limits,
+                stops_level=int(spec.stops_level),
+                spread_points=float(spec.spread_points),
+                lot=float(self.effective_lot()),
+                equity=self._account_equity(),
+                tick_value=float(self._tick_value),
+                tick_size=float(self._tick_size),
+                allow_short=bool(self.cfg.allow_short),
+                h4_ema_allow_short=bool(self.cfg.h4_ema_allow_short),
+                h1_use_sma50_200=bool(self.cfg.h1_use_sma50_200),
             )
-            questions = self.router.collect_questions(ctx)
+            questions = self.router.collect_questions(ctx, positions=positions)
             response = None
             if questions:
-                sent = self.router.state_for_request(ctx, questions)
+                sent = self.router.state_for_request(ctx, questions, positions=positions)
                 response = self.jev.system_one(sent, questions)
         except JevError as exc:
             # Retries and rate-limit backoff already ran inside the client.
@@ -491,7 +836,7 @@ class LiveSession:
             payload = getattr(self.jev, "last_payload", None)
             if payload is not None:
                 self._log("jev request payload: " + payload_text(payload))
-            return Decision(len(self.buffer) - 1, "hold", 0.0, 0.0, {}, "jev unavailable", {})
+            return []
         except (ConnectionLost, TradingHalted, KeyboardInterrupt):
             raise
         except Exception as exc:
@@ -500,113 +845,155 @@ class LiveSession:
         if response is not None and not self._answered:
             self._answered = True
             self._log(f"first answer · model {response.model}")
-        decision = self.router.decide(ctx, response)
-        feat = decision.features or {}
-        if decision.strategy and (
-            decision.action in ("buy", "sell")
-            or feat.get("setup_id")
-            or feat.get("nouls")
-            or feat.get("labels")
-        ):
+        decisions = self.router.decide_all(ctx, response, positions=positions)
+        buys = [d for d in decisions if d.action == "buy"]
+        sells = [d for d in decisions if d.action == "sell"]
+        if buys and sells:
             self._log(
-                f"signal · {decision.strategy} · {decision.action} · "
-                f"setup={feat.get('setup_id', '-')} · {feat}"
+                f"conflict · longs={[d.strategy for d in buys]} · "
+                f"shorts={[d.strategy for d in sells]} · allowing both"
+                + (" (no-hedge may block)" if self.cfg.no_hedge else "")
             )
-        line = self._act(decision, bar, now)
-        if line and (self.cfg.verbose or not line.startswith("hold")):
-            self._log(line)
-        if loss_breached(self.pnl(bar), self.limits.max_daily_loss):
-            self.flatten("daily loss limit")
-            raise TradingHalted("daily loss limit")
-        return decision
+        for decision in decisions:
+            feat = decision.features or {}
+            magic = decision.magic if decision.magic is not None else (
+                self.magic_of(decision.strategy) if decision.strategy else None
+            )
+            if decision.strategy and (
+                decision.action in ("buy", "sell", "exit")
+                or feat.get("setup_id")
+                or feat.get("nouls")
+                or feat.get("labels")
+            ):
+                self._log(
+                    f"signal · {decision.strategy} · magic={magic} · {decision.action} · "
+                    f"setup={feat.get('setup_id', feat.get('session_id', '-'))} · {feat}"
+                )
+            line = self._act(decision, bar, now)
+            if line and (self.cfg.verbose or not line.startswith("hold")):
+                self._log(line)
+        return decisions
 
     def _act(self, decision, bar, now: datetime) -> str:
+        strategy = decision.strategy or ""
+        if not strategy:
+            return f"hold {decision.reason}"
+        try:
+            magic = decision.magic if decision.magic is not None else self.magic_of(strategy)
+        except KeyError:
+            return f"hold unknown strategy magic: {strategy}"
+        tracked = self._tracked(magic)
+        tracked.strategy = strategy or tracked.strategy
         lines = []
-        closing = self.position and (
+        closing = tracked.side and (
             decision.action == "exit"
-            or (decision.action in ("buy", "sell") and (decision.action == "buy") != (self.position > 0))
+            or (
+                decision.action in ("buy", "sell")
+                and (decision.action == "buy") != (tracked.side > 0)
+            )
         )
         if closing:
-            lines.append(self._close(bar, decision.reason))
-        if decision.action in ("buy", "sell") and self.position == 0:
-            lines.append(self._open(1 if decision.action == "buy" else -1, decision, bar, now))
+            lines.append(self._close_magic(magic, bar, decision.reason, strategy=strategy))
+        if decision.action in ("buy", "sell"):
+            side = 1 if decision.action == "buy" else -1
+            # Re-read after a possible flip-close on this magic.
+            tracked = self._tracked(magic)
+            if tracked.side == 0:
+                lines.append(self._open(side, decision, bar, now, magic=magic, strategy=strategy))
+            elif tracked.side == side:
+                lines.append(
+                    f"blocked: {strategy} already has a position · magic={magic}"
+                )
         if not lines:
             return f"hold {decision.reason}"
         return " | ".join(x for x in lines if x)
 
-    def _close(self, bar, reason: str, px: float | None = None) -> str:
-        if self.cfg.dry_run:
-            if px is None:
-                px = bar.bid if self.position > 0 else bar.ask
-            self.realized += (px - self.px_in) * self.position * self.qty * (self._contract or 1.0)
-            self.position = 0
-            self.qty = 0.0
-            self._clear_stops()
-            return f"DRY-RUN EXIT @ {px:.2f} ({reason}) pnl {self.realized:+.2f}"
-        reports = self.broker.close_all()
+    def _close_magic(
+        self,
+        magic: int,
+        bar,
+        reason: str,
+        *,
+        px: float | None = None,
+        strategy: str = "",
+    ) -> str:
+        reports = self.broker.close_all(magic=magic)
         self.sync()
+        tracked = self._tracked(magic)
         bad = [r for r in reports if not r.ok]
-        if self.position or bad:
+        name = strategy or tracked.strategy or self.magic_strategy.get(magic, "-")
+        if tracked.side or bad:
             code = bad[0].retcode if bad else 0
-            return f"EXIT rejected retcode={code} ({reason})"
+            return (
+                f"EXIT rejected retcode={code} ({reason}) · "
+                f"magic={magic} · strategy={name}"
+            )
         shown = f" @ {px:.2f}" if px is not None else ""
-        self.qty = 0.0
-        self._clear_stops()
-        return f"EXIT{shown} ({reason})"
+        tracked.clear_stops()
+        return f"EXIT{shown} ({reason}) · magic={magic} · strategy={name}"
 
     def _trade_limits(self, decision) -> RiskLimits:
         """Global limits, with optional tighter strategy stops for this fill."""
         lim = self.limits
         sl = decision.sl_points if decision.sl_points is not None else lim.sl_points
         tp = decision.tp_points if decision.tp_points is not None else lim.tp_points
+        # Use the session lot (equity-scaled or fixed).
+        lim = replace(lim, lot=float(self.effective_lot()))
         if sl == lim.sl_points and tp == lim.tp_points:
             return lim
         return replace(lim, sl_points=sl, tp_points=tp)
 
-    def _open(self, side: int, decision, bar, now: datetime) -> str:
+    def _open(self, side: int, decision, bar, now: datetime, *, magic: int, strategy: str) -> str:
         if self.cfg.avoid is not None and self.cfg.avoid.blocks(now):
             return f"blocked: avoid hours {self.cfg.avoid.text} Europe/Berlin"
+        if self._tracked(magic).side:
+            return f"blocked: {strategy} already has a position · magic={magic}"
+        if self._hedge_blocked(side):
+            return (
+                f"blocked: no-hedge · opposite bot position open · "
+                f"magic={magic} · strategy={strategy}"
+            )
         try:
+            self._refresh_lot()
             spec = self.broker.spec()
             self._contract = spec.contract_size or self._contract or 1.0
             limits = self._trade_limits(decision)
-            intent = build_order(side, self.limits.lot * decision.size, spec, limits)
-            if self.cfg.dry_run:
-                count, current = (1 if self.position else 0), 0.0
-            else:
-                exp = self.broker.exposure()
-                count, current = exp.count, abs(exp.net)
-            check_entry(self.limits, intent.volume, count, current)
+            intent = build_order(side, self.effective_lot() * decision.size, spec, limits)
+            exp = self.broker.exposure()  # all bot magics
+            check_entry(self.limits, intent.volume, exp.count, float(exp.lots))
         except RiskError as exc:
             return f"blocked: {exc}"
         hold = decision.max_hold_seconds
         if hold is None:
             hold = self.cfg.max_hold_seconds
-        if self.cfg.dry_run:
-            self.position = side
-            self.qty = intent.volume
-            self.px_in = intent.price
-            self.t_in = bar.t
-            self.sl = intent.sl
-            self.tp = intent.tp
-            self.pos_hold_seconds = int(hold or 0)
-            self.router.note_fill(decision)
-            return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=True)
+        comment = order_comment(strategy)
+        self._log(
+            f"order · magic={magic} · strategy={strategy} · "
+            f"{'BUY' if side > 0 else 'SELL'} · comment={comment}"
+        )
         try:
-            report = self.broker.send(intent)
+            report = self.broker.send(intent, magic=magic, comment=comment)
         except ConnectionLost:
             raise
         if not report.ok:
-            return f"order rejected retcode={report.retcode}"
+            return (
+                f"order rejected retcode={report.retcode} · "
+                f"magic={magic} · strategy={strategy}"
+            )
         self.sync()
-        if self.position:
-            self.px_in = report.price or intent.price
-            self.t_in = bar.t
-            self.sl = intent.sl
-            self.tp = intent.tp
-            self.pos_hold_seconds = int(hold or 0)
+        tracked = self._tracked(magic)
+        if tracked.side:
+            tracked.strategy = strategy
+            tracked.px_in = report.price or intent.price
+            tracked.t_in = bar.t
+            tracked.sl = intent.sl
+            tracked.tp = intent.tp
+            tracked.hold_seconds = int(hold or 0)
             self.router.note_fill(decision)
-        return format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False) + f" retcode={report.retcode}"
+        return (
+            format_intent(self.broker.symbol, intent, spec.spread_points, dry_run=False)
+            + f" retcode={report.retcode} · magic={magic} · strategy={strategy}"
+        )
 
     def _log(self, msg: str) -> None:
         print(redact(msg), flush=True)

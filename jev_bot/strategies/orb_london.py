@@ -1,8 +1,9 @@
-"""London opening-range breakout with a TypeSafe confirmation Noul.
+"""London opening-range breakout with two TypeSafe confirmation Nouls per side.
 
 Flag ``--sig-orb`` (default off). The box is the first 30 minutes from the
 London open on ``Europe/London``. Optional New York open uses the same shape
 on ``America/New_York`` when ``session=\"ny\"``.
+Both Nouls on the active side must be yes (≥0.7); mid / missing / no → hold.
 """
 from __future__ import annotations
 
@@ -23,26 +24,40 @@ from .common import (
 from .minutes import MinuteBar
 
 NAME = "orb_london"
-YES_LONG = "orb_break_up"
-YES_SHORT = "orb_break_down"
-QUESTION_IDS = (YES_LONG, YES_SHORT)
+YES_LONG_BODY = "orb_break_up_body"
+YES_LONG_FOLLOW = "orb_break_up_follow"
+YES_SHORT_BODY = "orb_break_down_body"
+YES_SHORT_FOLLOW = "orb_break_down_follow"
+LONG_KEYS = (YES_LONG_BODY, YES_LONG_FOLLOW)
+SHORT_KEYS = (YES_SHORT_BODY, YES_SHORT_FOLLOW)
+QUESTION_IDS = LONG_KEYS + SHORT_KEYS
 BOX_MINUTES = 30
 TRADE_WINDOW_HOURS = 3
 
 
 def questions() -> dict[str, Question]:
     return {
-        YES_LONG: noul(
-            "Did the last closed minute in `orb` close clearly above the opening-range high, "
-            "and does `order_flow.aggressor_tape_30s_windows_oldest_first` support buying?",
-            "The close is above the box high and the aggressor tape favours buying.",
-            "The close is not a clear break above the box, or the tape does not support buying.",
+        YES_LONG_BODY: noul(
+            "Did the last closed minute in `orb` close clearly above the opening-range high?",
+            "The close is clearly above the box high.",
+            "The close is not a clear break above the box high.",
         ),
-        YES_SHORT: noul(
-            "Did the last closed minute in `orb` close clearly below the opening-range low, "
-            "and does `order_flow.aggressor_tape_30s_windows_oldest_first` support selling?",
-            "The close is below the box low and the aggressor tape favours selling.",
-            "The close is not a clear break below the box, or the tape does not support selling.",
+        YES_LONG_FOLLOW: noul(
+            "Does `order_flow.aggressor_tape_30s_windows_oldest_first` support buying "
+            "after the opening-range break higher?",
+            "The aggressor tape favours buying after the upside break.",
+            "The tape does not support buying after the upside break.",
+        ),
+        YES_SHORT_BODY: noul(
+            "Did the last closed minute in `orb` close clearly below the opening-range low?",
+            "The close is clearly below the box low.",
+            "The close is not a clear break below the box low.",
+        ),
+        YES_SHORT_FOLLOW: noul(
+            "Does `order_flow.aggressor_tape_30s_windows_oldest_first` support selling "
+            "after the opening-range break lower?",
+            "The aggressor tape favours selling after the downside break.",
+            "The tape does not support selling after the downside break.",
         ),
     }
 
@@ -147,6 +162,29 @@ def _stops(ctx: MarketContext, side: int, feat: dict) -> tuple[float, float, int
     return sl, tp, ctx.max_hold_seconds if ctx.max_hold_seconds > 0 else 0
 
 
+def _both_yes(
+    response: Response, keys: tuple[str, ...], policy: Policy,
+) -> tuple[str | None, dict]:
+    """Return ``(hold_reason, answers)``. ``hold_reason`` is None when both are yes."""
+    answers: dict = {}
+    for qid in QUESTION_IDS:
+        value = reading(response, qid)
+        if value is not None:
+            answers[qid] = {"type": "noul", "noul": value}
+    for key in keys:
+        label = band(reading(response, key), policy)
+        if label == "missing":
+            return f"{NAME}: answer missing ({key}); not read as no", answers
+        if label == "mid":
+            return (
+                f"{NAME}: {key} unsettled ({policy.no:g} to {policy.yes:g})",
+                answers,
+            )
+        if label == "no":
+            return f"{NAME}: {key} no", answers
+    return None, answers
+
+
 def decide(ctx: MarketContext, response: Response, policy: Policy | None = None,
            *, zone_name: str = "Europe/London",
            broken_days: set[str] | None = None) -> Signal:
@@ -158,33 +196,22 @@ def decide(ctx: MarketContext, response: Response, policy: Policy | None = None,
     if broken_days and feat["day"] in broken_days:
         return Signal("hold", f"{NAME}: first breakout already taken today", NAME, features=base)
     if feat["above"]:
-        key, action, side = YES_LONG, "buy", 1
+        keys, action, side = LONG_KEYS, "buy", 1
     elif feat["below"]:
-        key, action, side = YES_SHORT, "sell", -1
+        keys, action, side = SHORT_KEYS, "sell", -1
     else:
         return Signal("hold", f"{NAME}: still inside the box", NAME, features=base)
 
-    value = reading(response, key)
-    label = band(value, policy)
-    answers = {}
-    for qid in QUESTION_IDS:
-        v = reading(response, qid)
-        if v is not None:
-            answers[qid] = {"type": "noul", "noul": v}
-    if label == "missing":
-        return Signal("hold", f"{NAME}: answer missing ({key}); not read as no", NAME,
-                      features=base, answers=answers)
-    if label == "mid":
-        return Signal("hold", f"{NAME}: {key} unsettled ({policy.no:g} to {policy.yes:g})", NAME,
-                      features=base, answers=answers)
-    if label == "no":
-        return Signal("hold", f"{NAME}: {key} no", NAME, features=base, answers=answers)
+    hold_reason, answers = _both_yes(response, keys, policy)
+    if hold_reason is not None:
+        return Signal("hold", hold_reason, NAME, features=base, answers=answers)
     if ctx.position and (ctx.position > 0) == (side > 0):
         return Signal("hold", f"{NAME}: already positioned", NAME, features=base, answers=answers)
     sl, tp, hold = _stops(ctx, side, feat)
+    joined = " & ".join(keys)
     return Signal(
         action=action, size=1.0,
-        reason=f"{NAME}: {key} >= {policy.yes:g}, close={feat['last_close']:.2f}",
+        reason=f"{NAME}: {joined} >= {policy.yes:g}, close={feat['last_close']:.2f}",
         strategy=NAME, features=base, answers=answers,
         sl_points=sl, tp_points=tp, max_hold_seconds=hold if hold else None,
     )

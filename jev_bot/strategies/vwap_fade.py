@@ -1,7 +1,8 @@
-"""VWAP mean-reversion fade with a TypeSafe confirmation Noul.
+"""VWAP mean-reversion fade with two TypeSafe confirmation Nouls per side.
 
 Flag ``--sig-vwap-fade`` (default off). Code computes session VWAP, sigma and
 the cost gate; Jev only answers when that gate and the z-threshold pass.
+Both Nouls on the active side must be yes (≥0.7); mid / missing / no → hold.
 """
 from __future__ import annotations
 
@@ -23,26 +24,40 @@ from .common import (
 )
 
 NAME = "vwap_fade"
-YES_LONG = "vwap_fade_long"
-YES_SHORT = "vwap_fade_short"
-QUESTION_IDS = (YES_LONG, YES_SHORT)
+YES_LONG_FLOW = "vwap_fade_long_flow"
+YES_LONG_LOCATION = "vwap_fade_long_location"
+YES_SHORT_FLOW = "vwap_fade_short_flow"
+YES_SHORT_LOCATION = "vwap_fade_short_location"
+LONG_KEYS = (YES_LONG_FLOW, YES_LONG_LOCATION)
+SHORT_KEYS = (YES_SHORT_FLOW, YES_SHORT_LOCATION)
+QUESTION_IDS = LONG_KEYS + SHORT_KEYS
 
 
 def questions() -> dict[str, Question]:
     return {
-        YES_LONG: noul(
+        YES_LONG_FLOW: noul(
             "After a stretch under the lower VWAP band in `vwap_fade`, has selling pressure eased "
-            "and has the forming minute turned up, reading `order_flow.last_1_minute` and "
-            "`forming_candle.so_far`?",
-            "Selling has eased and the forming minute is turning up after trading below the lower band.",
-            "Selling is still in control, or the forming minute is not turning up.",
+            "in `order_flow.last_1_minute`?",
+            "Selling has eased; one-minute flow is balanced or buying after trading below the lower band.",
+            "Selling is still in control on the one-minute flow.",
         ),
-        YES_SHORT: noul(
+        YES_LONG_LOCATION: noul(
+            "After a stretch under the lower VWAP band in `vwap_fade`, has the forming minute "
+            "turned up in `forming_candle.so_far`?",
+            "The forming minute is turning up after trading below the lower band.",
+            "The forming minute is not turning up.",
+        ),
+        YES_SHORT_FLOW: noul(
             "After a stretch above the upper VWAP band in `vwap_fade`, has buying pressure eased "
-            "and has the forming minute turned down, reading `order_flow.last_1_minute` and "
-            "`forming_candle.so_far`?",
-            "Buying has eased and the forming minute is turning down after trading above the upper band.",
-            "Buying is still in control, or the forming minute is not turning down.",
+            "in `order_flow.last_1_minute`?",
+            "Buying has eased; one-minute flow is balanced or selling after trading above the upper band.",
+            "Buying is still in control on the one-minute flow.",
+        ),
+        YES_SHORT_LOCATION: noul(
+            "After a stretch above the upper VWAP band in `vwap_fade`, has the forming minute "
+            "turned down in `forming_candle.so_far`?",
+            "The forming minute is turning down after trading above the upper band.",
+            "The forming minute is not turning down.",
         ),
     }
 
@@ -151,6 +166,29 @@ def _stops(ctx: MarketContext, side: int, feat: dict) -> tuple[float, float, int
     return sl, tp, hold
 
 
+def _both_yes(
+    response: Response, keys: tuple[str, ...], policy: Policy,
+) -> tuple[str | None, dict]:
+    """Return ``(hold_reason, answers)``. ``hold_reason`` is None when both are yes."""
+    answers: dict = {}
+    for key in QUESTION_IDS:
+        value = reading(response, key)
+        if value is not None:
+            answers[key] = {"type": "noul", "noul": value}
+    for key in keys:
+        label = band(reading(response, key), policy)
+        if label == "missing":
+            return f"{NAME}: answer missing ({key}); not read as no", answers
+        if label == "mid":
+            return (
+                f"{NAME}: {key} unsettled ({policy.no:g} to {policy.yes:g})",
+                answers,
+            )
+        if label == "no":
+            return f"{NAME}: {key} no", answers
+    return None, answers
+
+
 def decide(ctx: MarketContext, response: Response, policy: Policy | None = None) -> Signal:
     policy = policy or Policy()
     feat = compute(ctx) or {}
@@ -159,33 +197,26 @@ def decide(ctx: MarketContext, response: Response, policy: Policy | None = None)
         return Signal("hold", f"{NAME}: cost gate blocked", NAME, features=base)
     z = feat["z"]
     if z <= -1.0:
-        key = YES_LONG
+        keys = LONG_KEYS
         side = 1
         action = "buy"
     elif z >= 1.0:
-        key = YES_SHORT
+        keys = SHORT_KEYS
         side = -1
         action = "sell"
     else:
         return Signal("hold", f"{NAME}: |z| < 1", NAME, features=base)
 
-    value = reading(response, key)
-    label = band(value, policy)
-    answers = {key: {"type": "noul", "noul": value} for key in QUESTION_IDS if reading(response, key) is not None}
-    if label == "missing":
-        return Signal("hold", f"{NAME}: answer missing ({key}); not read as no", NAME,
-                      features=base, answers=answers)
-    if label == "mid":
-        return Signal("hold", f"{NAME}: {key} unsettled ({policy.no:g} to {policy.yes:g})", NAME,
-                      features=base, answers=answers)
-    if label == "no":
-        return Signal("hold", f"{NAME}: {key} no", NAME, features=base, answers=answers)
+    hold_reason, answers = _both_yes(response, keys, policy)
+    if hold_reason is not None:
+        return Signal("hold", hold_reason, NAME, features=base, answers=answers)
     if ctx.position and (ctx.position > 0) == (side > 0):
         return Signal("hold", f"{NAME}: already positioned", NAME, features=base, answers=answers)
     sl, tp, hold = _stops(ctx, side, feat)
+    joined = " & ".join(keys)
     return Signal(
         action=action, size=1.0,
-        reason=f"{NAME}: {key} >= {policy.yes:g}, z={z:+.2f}, cost_ok",
+        reason=f"{NAME}: {joined} >= {policy.yes:g}, z={z:+.2f}, cost_ok",
         strategy=NAME, features=base, answers=answers,
         sl_points=sl, tp_points=tp, max_hold_seconds=hold,
     )

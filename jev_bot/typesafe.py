@@ -118,7 +118,7 @@ class Response:
 
 class SystemOne(Protocol):
     """Anything that answers typed questions about a state: the real Jev
-    client, the replay cache, or the offline surrogate."""
+    client or a replay cache."""
     model: str
 
     def system_one(self, state: Any, questions: dict[str, Question]) -> Response: ...
@@ -194,8 +194,10 @@ class JevClient:
         self.usage = Usage()
         self.last_payload: dict | None = None
         if not self.api_key and not cache_only:
-            raise JevError("TYPESAFE_API_KEY is not set. Use the offline surrogate (--model surrogate) "
-                           "or replay a recorded run (--replay-cache FILE).")
+            raise JevError(
+                "TYPESAFE_API_KEY is not set. Export it before calling ask, models, or live "
+                "(or pass --replay-cache FILE for offline replay)."
+            )
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
